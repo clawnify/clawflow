@@ -21,9 +21,13 @@
     "lint": "tsc --noEmit",
     "clean": "rm -rf dist"
   },
+  "openclaw": {
+    "extensions": ["./dist/plugin/index.js"]
+  },
   "files": [
     "dist",
     "src",
+    "openclaw.plugin.json",
     "README.md"
   ],
   "keywords": [

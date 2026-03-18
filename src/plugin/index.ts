@@ -19,7 +19,7 @@ interface PluginApi {
   };
 }
 
-export default function register(api: PluginApi) {
+function register(api: PluginApi) {
   const pluginCfg: PluginConfig =
     api.config?.plugins?.entries?.["openclaw-flow"]?.config ?? {};
 
@@ -361,3 +361,8 @@ Each node maps to a Cloudflare Workflows primitive:
     { optional: true },
   );
 }
+
+export default {
+  id: "openclaw-flow",
+  register,
+};
