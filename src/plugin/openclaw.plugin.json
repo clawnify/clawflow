@@ -1,0 +1,26 @@
+{
+  "id": "openclaw-flow",
+  "name": "OpenClaw Flow",
+  "description": "Agentic workflow engine for OpenClaw. AI-native, LLM-writable, Cloudflare-portable.",
+  "version": "0.2.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiKey": { "type": "string" },
+      "defaultModel": { "type": "string" },
+      "baseUrl": { "type": "string" },
+      "memoryDir": { "type": "string" },
+      "stateDir": { "type": "string" },
+      "maxNodeDurationMs": { "type": "number" }
+    }
+  },
+  "uiHints": {
+    "apiKey": { "label": "Anthropic API Key", "sensitive": true },
+    "defaultModel": { "label": "Default AI Model", "placeholder": "smart" },
+    "baseUrl": { "label": "API Base URL", "placeholder": "https://api.anthropic.com" },
+    "memoryDir": { "label": "Memory Directory" },
+    "stateDir": { "label": "Flow State Directory" },
+    "maxNodeDurationMs": { "label": "Node Timeout (ms)", "placeholder": "30000" }
+  }
+}
