@@ -227,6 +227,17 @@ export const MODEL_MAP: Record<string, string> = {
 };
 export const DEFAULT_MODEL = "claude-sonnet-4-6";
 
+// OpenRouter uses provider-prefixed IDs with dots (anthropic/claude-sonnet-4.6).
+// Maps both shorthand aliases and resolved Anthropic model IDs.
+export const OPENROUTER_MODEL_MAP: Record<string, string> = {
+  fast: "anthropic/claude-haiku-4.5",
+  smart: "anthropic/claude-sonnet-4.6",
+  best: "anthropic/claude-opus-4.6",
+  "claude-haiku-4-5-20251001": "anthropic/claude-haiku-4.5",
+  "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
+  "claude-opus-4-6": "anthropic/claude-opus-4.6",
+};
+
 // ---- Duration Parser ------------------------------------------------------------
 // Parses "30s", "5m", "2h", "1d" -> milliseconds
 

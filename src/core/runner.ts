@@ -10,6 +10,7 @@ import {
   TraceEntry,
   PluginConfig,
   MODEL_MAP,
+  OPENROUTER_MODEL_MAP,
   DEFAULT_MODEL,
   RetryPolicy,
   AiNode,
@@ -433,7 +434,17 @@ export class FlowRunner {
       this.detectGatewayUrl();
 
     if (gatewayUrl) {
-      return this.callGateway(gatewayUrl, model, system, prompt, temperature);
+      try {
+        return await this.callGateway(gatewayUrl, model, system, prompt, temperature);
+      } catch (err) {
+        // If gateway returns 404 (endpoint not enabled), fall through to direct API
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("404") || msg.includes("Not Found")) {
+          // Gateway doesn't have chat completions enabled — try direct API
+        } else {
+          throw err;
+        }
+      }
     }
 
     // 3. Direct API (OpenRouter > Anthropic > OpenAI)
@@ -507,10 +518,13 @@ export class FlowRunner {
     const openaiKey = process.env.OPENAI_API_KEY;
 
     if (openrouterKey) {
+      // OpenRouter uses provider-prefixed IDs with dots (anthropic/claude-sonnet-4.6)
+      // Resolve from shorthand aliases first, then pass through if already prefixed
+      const orModel = OPENROUTER_MODEL_MAP[model] ?? (model.includes("/") ? model : `anthropic/${model}`);
       return this.callOpenAiCompatible(
         "https://openrouter.ai/api",
         openrouterKey,
-        model,
+        orModel,
         system,
         prompt,
         temperature,
