@@ -673,10 +673,7 @@ export class FlowRunner {
       return null;
     }
 
-    const args = ["agent", "--message", message];
-    if (agentId) {
-      args.push("--agent", agentId);
-    }
+    const args = ["agent", "--agent", agentId ?? "main", "--message", message];
 
     try {
       const { stdout } = await execFileAsync("openclaw", args, {
