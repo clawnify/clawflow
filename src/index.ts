@@ -19,6 +19,7 @@ export type {
   AiNode,
   AgentNode,
   BranchNode,
+  ConditionNode,
   LoopNode,
   ParallelNode,
   HttpNode,

@@ -104,6 +104,104 @@ describe("FlowRunner — branch node", () => {
   });
 });
 
+// ---- FlowRunner: condition node -------------------------------------------------
+
+describe("FlowRunner — condition node", () => {
+  after(cleanup);
+
+  it("runs then branch when condition is true", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-condition-then",
+      nodes: [
+        { name: "set-val", do: "code" as const, run: "'premium'", output: "tier" },
+        {
+          name: "check", do: "condition" as const,
+          if: "tier == 'premium'",
+          then: [
+            { name: "premium-msg", do: "code" as const, run: "'VIP access'", output: "msg" },
+          ],
+          else: [
+            { name: "basic-msg", do: "code" as const, run: "'standard access'", output: "msg" },
+          ],
+        },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    assert.equal(result.state.msg, "VIP access");
+  });
+
+  it("runs else branch when condition is false", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-condition-else",
+      nodes: [
+        { name: "set-val", do: "code" as const, run: "'basic'", output: "tier" },
+        {
+          name: "check", do: "condition" as const,
+          if: "tier == 'premium'",
+          then: [
+            { name: "premium-msg", do: "code" as const, run: "'VIP access'", output: "msg" },
+          ],
+          else: [
+            { name: "basic-msg", do: "code" as const, run: "'standard access'", output: "msg" },
+          ],
+        },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    assert.equal(result.state.msg, "standard access");
+  });
+
+  it("skips else when absent and condition is false", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-condition-no-else",
+      nodes: [
+        { name: "set-val", do: "code" as const, run: "false", output: "flag" },
+        {
+          name: "check", do: "condition" as const,
+          if: "flag == true",
+          then: [
+            { name: "action", do: "code" as const, run: "'ran'", output: "result" },
+          ],
+        },
+        { name: "after", do: "code" as const, run: "'continued'", output: "final" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    assert.equal(result.state.result, undefined);
+    assert.equal(result.state.final, "continued");
+  });
+
+  it("handles nested dotted paths in condition", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-condition-dotted",
+      nodes: [
+        {
+          name: "check", do: "condition" as const,
+          if: "trigger.user.role == 'admin'",
+          then: [
+            { name: "admin-msg", do: "code" as const, run: "'admin panel'", output: "view" },
+          ],
+          else: [
+            { name: "user-msg", do: "code" as const, run: "'user dashboard'", output: "view" },
+          ],
+        },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, { user: { role: "admin" } });
+    assert.equal(result.state.view, "admin panel");
+
+    const result2 = await runner.run(flow, { user: { role: "viewer" } });
+    assert.equal(result2.state.view, "user dashboard");
+  });
+});
+
 // ---- FlowRunner: loop node ------------------------------------------------------
 
 describe("FlowRunner — loop node", () => {

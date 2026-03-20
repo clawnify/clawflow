@@ -38,6 +38,7 @@ export type FlowNode =
   | AiNode
   | AgentNode
   | BranchNode
+  | ConditionNode
   | LoopNode
   | ParallelNode
   | HttpNode
@@ -125,6 +126,39 @@ export interface CodeNode extends BaseNode {
   do: "code";
   run: string;
   input?: string;
+}
+
+/**
+ * condition — if/else with sub-node blocks that reconverge.
+ * Unlike branch (which jumps to a named node), condition runs inline
+ * sub-nodes and merges back into the main flow.
+ *
+ * The `if` field is a JS expression evaluated against flow state.
+ * Dotted paths like "order.status" resolve from state.
+ * Comparison operators: ==, !=, >, <, >=, <=
+ * Logical operators: &&, ||, !
+ *
+ * Example:
+ *   - name: check-transport
+ *     do: condition
+ *     if: "extractOrder.transport_type == 'CLIENTE'"
+ *     then:
+ *       - name: pickup-note
+ *         do: code
+ *         run: "'Client picks up'"
+ *         output: note
+ *     else:
+ *       - name: delivery-note
+ *         do: code
+ *         run: "'We deliver'"
+ *         output: note
+ *     output: condition_result
+ */
+export interface ConditionNode extends BaseNode {
+  do: "condition";
+  if: string; // JS expression evaluated against flow state
+  then: FlowNode[]; // nodes to run when condition is true
+  else?: FlowNode[]; // nodes to run when condition is false
 }
 
 // ---- Runtime Types --------------------------------------------------------------

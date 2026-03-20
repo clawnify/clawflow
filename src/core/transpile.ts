@@ -4,6 +4,7 @@ import type {
   AiNode,
   AgentNode,
   BranchNode,
+  ConditionNode,
   LoopNode,
   ParallelNode,
   HttpNode,
@@ -107,6 +108,34 @@ ${paths}${defaultLine}
 ${pad}}
 ${pad}// Note: Cloudflare Workflows don't support goto. Restructure branched
 ${pad}// nodes into separate methods or if/else blocks for production use.`;
+    }
+
+    case "condition": {
+      const n = node as ConditionNode;
+      const thenCode = n.then
+        .map((inner) => transpileNode(inner, indent + 2))
+        .join("\n");
+      const elseCode = n.else
+        ? n.else.map((inner) => transpileNode(inner, indent + 2)).join("\n")
+        : "";
+      const outputLine = n.output
+        ? `\n${pad}state["${n.output}"] = ${camel(node.name)};`
+        : "";
+      const elseBlock = elseCode
+        ? `\n${pad}} else {\n${elseCode}`
+        : "";
+      return `${pad}// condition: ${node.name}
+${pad}const ${camel(node.name)} = (() => {
+${pad}  if (${n.if.replace(/([a-zA-Z_]\w*(?:\.\w+)+)/g, (_m: string, p: string) => {
+        const parts = p.split(".");
+        return parts.length === 1
+          ? `state["${parts[0]}"]`
+          : `(state["${parts[0]}"] as Record<string, unknown>)?.["${parts.slice(1).join('"]?.["')}"]`;
+      })}) {
+${thenCode}${elseBlock}
+${pad}  }
+${pad}  return true;
+${pad}})();${outputLine}`;
     }
 
     case "loop": {

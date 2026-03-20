@@ -16,6 +16,7 @@ import {
   AiNode,
   AgentNode,
   BranchNode,
+  ConditionNode,
   LoopNode,
   ParallelNode,
   HttpNode,
@@ -333,6 +334,13 @@ export class FlowRunner {
         return this.execAgent(node as AgentNode, state);
       case "branch":
         return this.execBranch(node as BranchNode, state);
+      case "condition":
+        return this.execCondition(
+          node as ConditionNode,
+          state,
+          flow,
+          instanceId,
+        );
       case "loop":
         return this.execLoop(node as LoopNode, state, flow, instanceId);
       case "parallel":
@@ -653,6 +661,75 @@ export class FlowRunner {
         `branch "${node.name}": no path for "${value}" and no default`,
       );
     return { output: value, jump: target };
+  }
+
+  // ---- do: condition ------------------------------------------------------------
+  // If/else with inline sub-node blocks that reconverge into the main flow.
+
+  private async execCondition(
+    node: ConditionNode,
+    state: FlowState,
+    flow: FlowDefinition,
+    instanceId: string,
+  ): Promise<{ output: unknown }> {
+    // Evaluate the condition expression against flow state
+    const conditionResult = this.evalCondition(node.if, state);
+    const branch = conditionResult ? node.then : (node.else ?? []);
+
+    if (branch.length === 0) {
+      return { output: conditionResult };
+    }
+
+    // Execute the chosen branch as a sub-flow
+    const branchName = conditionResult ? "then" : "else";
+    const subFlow: FlowDefinition = {
+      flow: `${flow.flow}:condition:${node.name}:${branchName}`,
+      nodes: branch,
+    };
+    const subId = `${instanceId}:condition:${node.name}:${branchName}`;
+    this.store.create(subId, subFlow.flow, state);
+    const subResult = await this.execute(subFlow, state, subId, 0, []);
+    if (!subResult.ok) {
+      throw new Error(
+        `condition "${node.name}" ${branchName} branch failed: ${subResult.error}`,
+      );
+    }
+
+    // Merge sub-flow state back into parent
+    Object.assign(state, subResult.state);
+    return { output: conditionResult };
+  }
+
+  private evalCondition(expr: string, state: FlowState): boolean {
+    // Keywords and literals that should not be resolved as state paths
+    const reserved = new Set([
+      "true", "false", "null", "undefined", "NaN", "Infinity",
+      "typeof", "instanceof", "in", "new", "void", "delete",
+    ]);
+
+    // Replace identifiers and dotted paths with their resolved values
+    const resolved = expr.replace(
+      /([a-zA-Z_][\w]*(?:\.[\w]+)*)/g,
+      (_match, path: string) => {
+        if (reserved.has(path)) return path;
+        // Only resolve if the identifier exists in state
+        const val = this.getPath(state, path);
+        if (val === undefined && !path.includes(".")) {
+          // Bare identifier not in state — leave as-is (might be a JS keyword)
+          return path;
+        }
+        return JSON.stringify(val);
+      },
+    );
+    try {
+      // eslint-disable-next-line no-new-func
+      const fn = new Function("state", `"use strict"; return !!(${resolved});`);
+      return fn(state);
+    } catch {
+      throw new Error(
+        `condition expression failed: "${expr}" (resolved: "${resolved}")`,
+      );
+    }
   }
 
   // ---- do: loop -----------------------------------------------------------------
