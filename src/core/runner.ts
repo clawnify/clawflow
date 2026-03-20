@@ -719,30 +719,26 @@ export class FlowRunner {
       }
     }
 
-    // 3. Extract the first JSON object or array from mixed text
-    // (handles CLI output with logs/text before or after the JSON)
-    const objStart = text.indexOf("{");
-    const arrStart = text.indexOf("[");
-    const start =
-      objStart >= 0 && arrStart >= 0
-        ? Math.min(objStart, arrStart)
-        : objStart >= 0
-          ? objStart
-          : arrStart;
-
-    if (start >= 0) {
-      const opener = text[start];
-      const closer = opener === "{" ? "}" : "]";
-      // Find matching closer by counting brackets
-      let depth = 0;
-      for (let i = start; i < text.length; i++) {
-        if (text[i] === opener) depth++;
-        else if (text[i] === closer) depth--;
-        if (depth === 0) {
-          try {
-            return JSON.parse(text.slice(start, i + 1));
-          } catch {
-            break;
+    // 3. Extract JSON from mixed text (CLI output with log lines before/after)
+    // Try from the LAST occurrence first — CLI logs often contain stray { }
+    // characters (e.g. "[model-router] v2 registered (keyword + NLI)")
+    // but the actual JSON payload is typically at the end of output.
+    for (const bracket of ["{", "["] as const) {
+      const closer = bracket === "{" ? "}" : "]";
+      // Try last occurrence first, then first
+      const positions = [text.lastIndexOf(bracket), text.indexOf(bracket)];
+      for (const start of positions) {
+        if (start < 0) continue;
+        let depth = 0;
+        for (let i = start; i < text.length; i++) {
+          if (text[i] === bracket) depth++;
+          else if (text[i] === closer) depth--;
+          if (depth === 0) {
+            try {
+              return JSON.parse(text.slice(start, i + 1));
+            } catch {
+              break;
+            }
           }
         }
       }
