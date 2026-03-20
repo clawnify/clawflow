@@ -108,7 +108,7 @@ A flow is a JSON (or YAML) document. No custom syntax, no new language — just 
 
 ## Node Types
 
-Exactly 9 node types. This is intentional — the constraint is the feature. An LLM can reliably generate valid flows because there's nothing to hallucinate.
+10 node types. This is intentional — the constraint is the feature. An LLM can reliably generate valid flows because there's nothing to hallucinate.
 
 ### `do: ai` — LLM call
 
@@ -142,26 +142,34 @@ The most important node. A single LLM call that returns structured or freeform o
 
 ---
 
-### `do: agent` — autonomous sub-task
+### `do: agent` — delegate to a real agent
 
-For tasks where the number of steps is unknown in advance. The agent decides its own path to a result.
+Runs a task through a real OpenClaw agent with full tool access (browser, exec, memory, etc.). The agent decides its own path to a result.
 
 ```json
 {
-  "name": "investigate",
+  "name": "scrape",
   "do": "agent",
-  "task": "Research {{ classification.category }} issues and propose a fix",
-  "tools": ["web_search", "read_file"],
-  "timeout": "5m",
-  "output": "investigation"
+  "task": "Navigate to https://example.com and extract the pricing table as JSON",
+  "agent": "main",
+  "timeout": "120s",
+  "output": "data"
 }
 ```
 
-Unlike `do: ai`, an agent node can take multiple turns, use tools, and produce work that requires reasoning over an extended context. On OpenClaw it delegates to `sessions_spawn`. On other runtimes it uses a high-capability model with extended context.
+On OpenClaw, this delegates to `openclaw agent --agent <id> --message "..."`. The agent gets full tool access — browser, shell, file system, memory. Falls back to a single AI call if the CLI is unavailable (standalone mode).
+
+| Field | Description |
+|---|---|
+| `task` | The instruction to the agent. Supports `{{ templates }}`. |
+| `agent` | OpenClaw agent ID (e.g. `"main"`, `"ops"`). Uses config `defaultAgent` or `"main"` if omitted. |
+| `input` | Dotted path to context passed with the task |
+| `tools` | Hint for non-OpenClaw runtimes (OpenClaw agents have their own tool policy) |
+| `model` | Model for fallback AI call (standalone mode only) |
 
 The distinction between `ai` and `agent` is intentional:
 - `do: ai` = deterministic, one-shot, structured output — use for classification, drafting, extraction
-- `do: agent` = open-ended, multi-step, judgment-required — use for research, debugging, planning
+- `do: agent` = open-ended, multi-step, uses tools — use for scraping, research, file operations
 
 ---
 
@@ -184,6 +192,41 @@ Routes the flow to a different node based on a value in state.
 ```
 
 Branches jump to named nodes. The `default` path handles any value not explicitly listed. No `default` + no matching path = runtime error (intentional — fail loudly).
+
+**Note:** `branch` jumps to a target node and continues sequentially from there. For if/else logic that reconverges, use `do: condition` instead.
+
+---
+
+### `do: condition` — if/else with reconvergence
+
+Runs inline sub-node blocks based on a condition, then merges back into the main flow. Unlike `branch` (which jumps), condition blocks are self-contained.
+
+```json
+{
+  "name": "check-transport",
+  "do": "condition",
+  "if": "extractOrder.transport_type == 'CLIENTE'",
+  "then": [
+    { "name": "pickup-note", "do": "code", "run": "'Client picks up'", "output": "note" }
+  ],
+  "else": [
+    { "name": "delivery-note", "do": "code", "run": "'We deliver'", "output": "note" }
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `if` | JS expression evaluated against flow state. Dotted paths are resolved. |
+| `then` | Nodes to run when condition is true |
+| `else` | Nodes to run when condition is false (optional — skipped if absent) |
+
+Supports comparison and logical operators:
+```
+"classification.priority == 'urgent'"
+"validation.valid && items.length > 0"
+"trigger.amount > 1000 || trigger.vip == true"
+```
 
 ---
 
@@ -411,8 +454,9 @@ Five tools registered in OpenClaw:
 
 **Install:**
 ```bash
-cp -r clawflow ~/.openclaw/extensions/clawflow
-cd ~/.openclaw/extensions/clawflow && npm install --ignore-scripts
+git clone https://github.com/clawnify/clawflow.git
+cd clawflow && npm install && npm run build
+openclaw plugins install --link ./clawflow
 ```
 
 **Config:**
@@ -560,7 +604,11 @@ Rules:
 ## Roadmap
 
 ### v0.2 — Current (OpenClaw plugin)
-- [x] 9 node types: ai, agent, branch, loop, parallel, http, memory, wait, sleep, code
+- [x] 10 node types: ai, agent, branch, condition, loop, parallel, http, memory, wait, sleep, code
+- [x] `do: agent` delegates to real OpenClaw agents via CLI (browser, exec, memory)
+- [x] `do: condition` — if/else blocks that reconverge into the main flow
+- [x] Auto-detect OpenClaw gateway for AI calls (OpenRouter, Anthropic, OpenAI fallbacks)
+- [x] Plugin ships a skill (SKILL.md) so agents know how to write flows
 - [x] Per-node retry with exponential/linear/constant backoff
 - [x] `waitForEvent` — external systems push events into waiting flows
 - [x] Durable state: memoized node outputs persist across restarts
