@@ -31,7 +31,7 @@ interface PluginApi {
 
 function register(api: PluginApi) {
   const rawCfg: PluginConfig =
-    api.config?.plugins?.entries?.["openclaw-flow"]?.config ?? {};
+    api.config?.plugins?.entries?.["clawflow"]?.config ?? {};
 
   // Auto-detect gateway URL when running inside OpenClaw
   const gatewayPort =
@@ -418,6 +418,6 @@ Each node maps to a Cloudflare Workflows primitive:
 }
 
 export default {
-  id: "openclaw-flow",
+  id: "clawflow",
   register,
 };

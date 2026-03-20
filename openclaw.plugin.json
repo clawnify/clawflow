@@ -1,5 +1,5 @@
 {
-  "id": "openclaw-flow",
+  "id": "clawflow",
   "name": "ClawFlow",
   "description": "The n8n for agents. Declarative, AI-native workflow engine — LLM-writable, Cloudflare-portable.",
   "version": "0.2.2",
