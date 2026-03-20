@@ -72,6 +72,8 @@ export interface AgentNode extends BaseNode {
   input?: string;
   tools?: string[];
   model?: string;
+  /** OpenClaw agent ID to delegate to (e.g. "main", "ops"). Uses OpenClaw's default routing if omitted. */
+  agent?: string;
 }
 
 export interface BranchNode extends BaseNode {

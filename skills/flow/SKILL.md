@@ -23,7 +23,7 @@ A flow is JSON with a `flow` name and a `nodes` array. Call `flow_run` with the 
 | Node | Purpose | Key fields |
 |------|---------|------------|
 | `ai` | Single LLM call, structured or freeform | `prompt`, `schema`, `model`, `input` |
-| `agent` | Open-ended autonomous task | `task`, `tools`, `model` |
+| `agent` | Delegate to a real OpenClaw agent (with tools, browser, etc.) | `task`, `agent`, `tools`, `model` |
 | `branch` | Jump to a named node based on a value | `on`, `paths`, `default` |
 | `condition` | If/else with sub-node blocks that reconverge | `if`, `then`, `else` |
 | `loop` | Iterate over an array | `over`, `as`, `nodes` |
@@ -40,7 +40,9 @@ A flow is JSON with a `flow` name and a `nodes` array. Call `flow_run` with the 
 - Use `output` to name a node's result — other nodes reference it as `{{ nodeName.field }}`
 - Always add `schema` to `ai` nodes when downstream nodes need typed fields
 - Use `retry` on `http` and `ai` nodes: `{ "limit": 3, "delay": "2s", "backoff": "exponential" }`
-- Use `do: agent` for open-ended research/tasks, `do: ai` for structured extraction
+- Use `do: agent` for tasks that need tools (browser, exec, memory) — delegates to a real OpenClaw agent
+- Use `do: ai` for structured extraction and single-turn LLM calls
+- Set `agent: "ops"` on agent nodes to target a specific OpenClaw agent ID
 - `do: wait` with `for: approval` pauses for human review before side effects
 - `do: condition` runs inline then/else blocks and merges back (unlike `branch` which jumps)
 - Model shorthands: `fast` (Haiku), `smart` (Sonnet), `best` (Opus)

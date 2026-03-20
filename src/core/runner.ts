@@ -622,7 +622,8 @@ export class FlowRunner {
   }
 
   // ---- do: agent ----------------------------------------------------------------
-  // Falls back to a high-capability ai node. Future: delegate to sessions_spawn.
+  // Delegates to a real OpenClaw agent via CLI. The agent gets full tool access
+  // (browser, exec, memory, etc.). Falls back to AI call if CLI unavailable.
 
   private async execAgent(
     node: AgentNode,
@@ -635,7 +636,14 @@ export class FlowRunner {
         ? `${task}\n\nContext:\n${typeof input === "object" ? JSON.stringify(input, null, 2) : String(input)}`
         : task;
 
-    return this.execAi(
+    // Try OpenClaw agent CLI first (real agent with tools)
+    const cliResult = await this.tryOpenClawAgent(fullPrompt, node.agent);
+    if (cliResult !== null) {
+      return { output: this.autoParseJson(cliResult) };
+    }
+
+    // Fallback: single AI call (no tools, no browser)
+    const result = await this.execAi(
       {
         ...node,
         do: "ai",
@@ -646,6 +654,66 @@ export class FlowRunner {
       },
       state,
     );
+    result.output = this.autoParseJson(result.output);
+    return result;
+  }
+
+  private async tryOpenClawAgent(
+    message: string,
+    agentId?: string,
+  ): Promise<string | null> {
+    const { execFile } = await import("child_process");
+    const { promisify } = await import("util");
+    const execFileAsync = promisify(execFile);
+
+    // Check if openclaw CLI is available
+    try {
+      await execFileAsync("which", ["openclaw"]);
+    } catch {
+      return null;
+    }
+
+    const args = ["agent", "--message", message];
+    if (agentId) {
+      args.push("--agent", agentId);
+    }
+
+    try {
+      const { stdout } = await execFileAsync("openclaw", args, {
+        timeout: this.cfg.maxNodeDurationMs ?? 120_000,
+        maxBuffer: 10 * 1024 * 1024, // 10MB
+        env: { ...process.env },
+      });
+      return stdout.trim();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // If CLI fails (gateway down, etc.), return null to fall back to AI
+      if (msg.includes("ENOENT") || msg.includes("not found")) {
+        return null;
+      }
+      // Real execution errors should propagate
+      throw new Error(`openclaw agent failed: ${msg}`);
+    }
+  }
+
+  private autoParseJson(value: unknown): unknown {
+    if (typeof value !== "string") return value;
+    const text = (value as string).trim();
+    const clean = text
+      .replace(/^```(?:json)?\n?/m, "")
+      .replace(/\n?```$/m, "")
+      .trim();
+    if (
+      (clean.startsWith("{") && clean.endsWith("}")) ||
+      (clean.startsWith("[") && clean.endsWith("]"))
+    ) {
+      try {
+        return JSON.parse(clean);
+      } catch {
+        // Keep as string
+      }
+    }
+    return value;
   }
 
   // ---- do: branch ---------------------------------------------------------------
