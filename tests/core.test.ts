@@ -415,4 +415,85 @@ describe("transpileToCloudflare", () => {
     assert.ok(ts.includes('"approval"'));
     assert.ok(ts.includes('"stripe-webhook"'));
   });
+
+  it("includes applyFilter in transpiled output", () => {
+    const flow: FlowDefinition = {
+      flow: "test-filter-transpile",
+      nodes: [
+        { name: "greet", do: "ai" as const, prompt: "hi" },
+      ],
+    };
+    const ts = transpileToCloudflare(flow);
+    assert.ok(ts.includes("applyFilter"));
+    assert.ok(ts.includes('"tojson"'));
+  });
+});
+
+// ---- Template filters -------------------------------------------------------------
+
+describe("template filters", () => {
+  let runner: FlowRunner;
+
+  before(() => {
+    runner = new FlowRunner(cfg);
+  });
+
+  after(cleanup);
+
+  const state = {
+    trigger: { body: "hello world" },
+    plan: { title: "My Plan", tags: ["a", "b", "c"] },
+    data: { count: 42, nested: { x: 1, y: 2 }, text: "  padded  " },
+  };
+
+  it("tojson serializes objects", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.tags | tojson }}", state), '["a","b","c"]');
+  });
+
+  it("tojson passes strings through", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.title | tojson }}", state), "My Plan");
+  });
+
+  it("upper converts to uppercase", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.title | upper }}", state), "MY PLAN");
+  });
+
+  it("lower converts to lowercase", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.title | lower }}", state), "my plan");
+  });
+
+  it("trim strips whitespace", () => {
+    assert.equal(runner.resolveTemplate("{{ data.text | trim }}", state), "padded");
+  });
+
+  it("length returns array length", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.tags | length }}", state), "3");
+  });
+
+  it("length returns string length", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.title | length }}", state), "7");
+  });
+
+  it("length returns object key count", () => {
+    assert.equal(runner.resolveTemplate("{{ data.nested | length }}", state), "2");
+  });
+
+  it("unknown filter falls back to string conversion", () => {
+    assert.equal(runner.resolveTemplate("{{ data.count | nope }}", state), "42");
+  });
+
+  it("works without filter (unchanged behavior)", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.title }}", state), "My Plan");
+  });
+
+  it("preserves unresolved templates", () => {
+    assert.equal(runner.resolveTemplate("{{ missing.path }}", state), "{{missing.path}}");
+  });
+
+  it("filter in mixed text", () => {
+    assert.equal(
+      runner.resolveTemplate("Title: {{ plan.title | upper }}!", state),
+      "Title: MY PLAN!",
+    );
+  });
 });

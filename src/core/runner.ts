@@ -54,6 +54,28 @@ export function sendEvent(
   return true;
 }
 
+// ---- Template filters -----------------------------------------------------------
+
+function applyFilter(val: unknown, filter: string): unknown {
+  switch (filter) {
+    case "tojson":
+      return typeof val === "string" ? val : JSON.stringify(val);
+    case "upper":
+      return String(val).toUpperCase();
+    case "lower":
+      return String(val).toLowerCase();
+    case "trim":
+      return String(val).trim();
+    case "length":
+      if (Array.isArray(val)) return val.length;
+      if (typeof val === "string") return val.length;
+      if (val !== null && typeof val === "object") return Object.keys(val).length;
+      return 0;
+    default:
+      return typeof val === "object" ? JSON.stringify(val) : String(val);
+  }
+}
+
 // ---- Runner ---------------------------------------------------------------------
 
 export class FlowRunner {
@@ -1083,10 +1105,11 @@ export class FlowRunner {
   private resolveBodyObject(obj: unknown, state: FlowState): unknown {
     if (typeof obj === "string") {
       // Check if the entire string is a single template expression
-      const singleMatch = obj.match(/^\{\{\s*([\w.]+)\s*\}\}$/);
+      const singleMatch = obj.match(/^\{\{\s*([\w.]+)\s*(?:\|\s*(\w+))?\s*\}\}$/);
       if (singleMatch) {
         const val = this.getPath(state, singleMatch[1]);
-        return val !== undefined ? val : obj;
+        if (val === undefined) return obj;
+        return singleMatch[2] ? applyFilter(val, singleMatch[2]) : val;
       }
       return this.resolveTemplate(obj, state);
     }
@@ -1104,13 +1127,11 @@ export class FlowRunner {
   }
 
   resolveTemplate(template: string, state: FlowState): string {
-    return template.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_m, p: string) => {
+    return template.replace(/\{\{\s*([\w.]+)\s*(?:\|\s*(\w+))?\s*\}\}/g, (_m, p: string, filter?: string) => {
       const val = this.getPath(state, p);
-      return val === undefined
-        ? `{{${p}}}`
-        : typeof val === "object"
-          ? JSON.stringify(val)
-          : String(val);
+      if (val === undefined) return `{{${p}}}`;
+      if (filter) return String(applyFilter(val, filter));
+      return typeof val === "object" ? JSON.stringify(val) : String(val);
     });
   }
 

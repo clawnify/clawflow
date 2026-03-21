@@ -40,12 +40,31 @@ type Params = {
   [key: string]: unknown;
 };
 
+// Template filters
+function applyFilter(val: unknown, filter: string): unknown {
+  switch (filter) {
+    case "tojson": return typeof val === "string" ? val : JSON.stringify(val);
+    case "upper": return String(val).toUpperCase();
+    case "lower": return String(val).toLowerCase();
+    case "trim": return String(val).trim();
+    case "length": {
+      if (Array.isArray(val)) return val.length;
+      if (typeof val === "string") return val.length;
+      if (val !== null && typeof val === "object") return Object.keys(val).length;
+      return 0;
+    }
+    default: return typeof val === "object" ? JSON.stringify(val) : String(val);
+  }
+}
+
 // Template resolver
 function resolveTemplate(state: Record<string, unknown>, template: string): string {
-  return template.replace(/\\{\\{\\s*([\\w.]+)\\s*\\}\\}/g, (_, path: string) => {
+  return template.replace(/\\{\\{\\s*([\\w.]+)\\s*(?:\\|\\s*(\\w+))?\\s*\\}\\}/g, (_: string, path: string, filter?: string) => {
     const val = path.split(".").reduce((o: unknown, k: string) =>
       o != null && typeof o === "object" ? (o as Record<string, unknown>)[k] : undefined, state);
-    return val === undefined ? \`{{\${path}}}\` : typeof val === "object" ? JSON.stringify(val) : String(val);
+    if (val === undefined) return \`{{\${path}}}\`;
+    if (filter) return String(applyFilter(val, filter));
+    return typeof val === "object" ? JSON.stringify(val) : String(val);
   });
 }
 
