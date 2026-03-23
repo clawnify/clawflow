@@ -114,19 +114,20 @@ ${pad}});${outputLine}`;
           ? `state["${onParts[0]}"]`
           : `(state["${onParts[0]}"] as Record<string, unknown>)?.["${onParts.slice(1).join('"]?.["')}"]`;
       const paths = Object.entries(n.paths)
-        .map(
-          ([val, target], i) =>
-            `${pad}${i === 0 ? "if" : "} else if"} (String(${stateAccess}) === "${val}") {\n${pad}  // -> ${target}`,
-        )
+        .map(([val, nodes], i) => {
+          const innerCode = nodes.map((inner) => transpileNode(inner, indent + 2)).join("\n");
+          return `${pad}${i === 0 ? "if" : "} else if"} (String(${stateAccess}) === "${val}") {\n${innerCode}`;
+        })
         .join("\n");
-      const defaultLine = n.default
-        ? `\n${pad}} else {\n${pad}  // -> ${n.default}`
+      const defaultBlock = n.default
+        ? `\n${pad}} else {\n${n.default.map((inner) => transpileNode(inner, indent + 2)).join("\n")}`
+        : "";
+      const outputLine = n.output
+        ? `\n${pad}state["${n.output}"] = String(${stateAccess});`
         : "";
       return `${pad}// branch: ${node.name}
-${paths}${defaultLine}
-${pad}}
-${pad}// Note: Cloudflare Workflows don't support goto. Restructure branched
-${pad}// nodes into separate methods or if/else blocks for production use.`;
+${paths}${defaultBlock}
+${pad}}${outputLine}`;
     }
 
     case "condition": {

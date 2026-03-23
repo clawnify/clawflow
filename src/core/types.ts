@@ -79,8 +79,8 @@ export interface AgentNode extends BaseNode {
 export interface BranchNode extends BaseNode {
   do: "branch";
   on: string; // dotted path in flow state
-  paths: Record<string, string>; // value -> node name to jump to
-  default?: string; // node name if no path matches
+  paths: Record<string, FlowNode[]>; // value -> sub-flow to execute
+  default?: FlowNode[]; // sub-flow if no path matches
 }
 
 export interface LoopNode extends BaseNode {
@@ -132,8 +132,9 @@ export interface CodeNode extends BaseNode {
 
 /**
  * condition — if/else with sub-node blocks that reconverge.
- * Unlike branch (which jumps to a named node), condition runs inline
- * sub-nodes and merges back into the main flow.
+ * Like branch, condition runs inline sub-nodes and merges back into
+ * the main flow. Use condition for boolean logic, branch for multi-way
+ * value matching.
  *
  * The `if` field is a JS expression evaluated against flow state.
  * Dotted paths like "order.status" resolve from state.

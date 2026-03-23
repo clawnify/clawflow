@@ -77,17 +77,34 @@ A flow is a JSON (or YAML) document. No custom syntax, no new language — just 
       "do": "branch",
       "on": "classification.category",
       "paths": {
-        "billing":   "handle-billing",
-        "technical": "handle-technical"
+        "billing": [
+          {
+            "name": "handle-billing",
+            "do": "agent",
+            "task": "Draft a billing support reply for: {{ trigger.body }}",
+            "model": "smart",
+            "output": "draft"
+          }
+        ],
+        "technical": [
+          {
+            "name": "handle-technical",
+            "do": "agent",
+            "task": "Draft a technical support reply for: {{ trigger.body }}",
+            "model": "smart",
+            "output": "draft"
+          }
+        ]
       },
-      "default": "handle-general"
-    },
-    {
-      "name": "handle-billing",
-      "do": "agent",
-      "task": "Draft a billing support reply for: {{ trigger.body }}",
-      "model": "smart",
-      "output": "draft"
+      "default": [
+        {
+          "name": "handle-general",
+          "do": "agent",
+          "task": "Draft a general support reply for: {{ trigger.body }}",
+          "model": "smart",
+          "output": "draft"
+        }
+      ]
     },
     {
       "name": "approve",
@@ -176,9 +193,9 @@ The distinction between `ai` and `agent` is intentional:
 
 ---
 
-### `do: branch` — conditional routing
+### `do: branch` — multi-way routing
 
-Routes the flow to a different node based on a value in state.
+Routes the flow to a sub-flow based on a value in state. Each path is an array of nodes that executes as a self-contained block, then reconverges back into the main flow.
 
 ```json
 {
@@ -186,23 +203,29 @@ Routes the flow to a different node based on a value in state.
   "do": "branch",
   "on": "classification.category",
   "paths": {
-    "billing":   "handle-billing",
-    "technical": "handle-technical",
-    "general":   "handle-general"
+    "billing": [
+      { "name": "lookup-invoice", "do": "http", "url": "https://api.example.com/invoice/{{ trigger.id }}", "output": "invoice" },
+      { "name": "draft-reply", "do": "ai", "prompt": "Draft billing reply for: {{ invoice }}", "output": "draft" }
+    ],
+    "technical": [
+      { "name": "draft-reply", "do": "agent", "task": "Research and draft technical reply for: {{ trigger.body }}", "output": "draft" }
+    ]
   },
-  "default": "handle-general"
+  "default": [
+    { "name": "draft-reply", "do": "ai", "prompt": "Draft a general reply for: {{ trigger.body }}", "output": "draft" }
+  ]
 }
 ```
 
-Branches jump to named nodes. The `default` path handles any value not explicitly listed. No `default` + no matching path = runtime error (intentional — fail loudly).
+Each path runs its full node sequence and merges state back. The `default` path handles any value not explicitly listed. No `default` + no matching path = runtime error (intentional — fail loudly).
 
-**Note:** `branch` jumps to a target node and continues sequentially from there. For if/else logic that reconverges, use `do: condition` instead.
+Use `branch` for multi-way value matching, `condition` for boolean if/else logic. Both support full sub-flows and reconverge automatically.
 
 ---
 
 ### `do: condition` — if/else with reconvergence
 
-Runs inline sub-node blocks based on a condition, then merges back into the main flow. Unlike `branch` (which jumps), condition blocks are self-contained.
+Runs inline sub-node blocks based on a boolean condition, then merges back into the main flow. Use `condition` for true/false logic, `branch` for multi-way value matching.
 
 ```json
 {

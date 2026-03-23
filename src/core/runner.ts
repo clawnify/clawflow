@@ -219,25 +219,6 @@ export class FlowRunner {
           };
         }
 
-        // ---- Branch jump --------------------------------------------------------
-        if (result.jump) {
-          const targetIndex = nodes.findIndex((n) => n.name === result.jump);
-          if (targetIndex === -1)
-            throw new Error(`Branch target "${result.jump}" not found`);
-          if (node.output) state[node.output] = result.output;
-          this.store.memoize(instanceId, node.name, result.output);
-          this.store.update(instanceId, { state });
-          trace.push({
-            node: node.name,
-            do: node.do,
-            status: "ok",
-            output: result.output,
-            durationMs: Date.now() - t0,
-          });
-          i = targetIndex;
-          continue;
-        }
-
         // ---- Normal completion --------------------------------------------------
         if (node.output) state[node.output] = result.output;
         this.store.memoize(instanceId, node.name, result.output);
@@ -293,7 +274,6 @@ export class FlowRunner {
     instanceId: string,
   ): Promise<{
     output?: unknown;
-    jump?: string;
     pause?: boolean;
     attempts?: number;
   }> {
@@ -348,14 +328,14 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
-  ): Promise<{ output?: unknown; jump?: string; pause?: boolean }> {
+  ): Promise<{ output?: unknown; pause?: boolean }> {
     switch (node.do) {
       case "ai":
         return this.execAi(node as AiNode, state);
       case "agent":
         return this.execAgent(node as AgentNode, state);
       case "branch":
-        return this.execBranch(node as BranchNode, state);
+        return this.execBranch(node as BranchNode, state, flow, instanceId);
       case "condition":
         return this.execCondition(
           node as ConditionNode,
@@ -785,17 +765,40 @@ export class FlowRunner {
 
   // ---- do: branch ---------------------------------------------------------------
 
-  private execBranch(
+  private async execBranch(
     node: BranchNode,
     state: FlowState,
-  ): { output: unknown; jump: string } {
+    flow: FlowDefinition,
+    instanceId: string,
+  ): Promise<{ output: unknown }> {
     const value = String(this.getPath(state, node.on) ?? "");
-    const target = node.paths[value] ?? node.default;
-    if (!target)
+    const branch = node.paths[value] ?? node.default;
+    if (!branch)
       throw new Error(
         `branch "${node.name}": no path for "${value}" and no default`,
       );
-    return { output: value, jump: target };
+
+    if (branch.length === 0) {
+      return { output: value };
+    }
+
+    // Execute the matched path as a sub-flow (same pattern as condition)
+    const pathName = value in node.paths ? value : "default";
+    const subFlow: FlowDefinition = {
+      flow: `${flow.flow}:branch:${node.name}:${pathName}`,
+      nodes: branch,
+    };
+    const subId = `${instanceId}:branch:${node.name}:${pathName}`;
+    this.store.create(subId, subFlow.flow, state);
+    const subResult = await this.execute(subFlow, state, subId, 0, []);
+    if (!subResult.ok) {
+      throw new Error(
+        `branch "${node.name}" path "${pathName}" failed: ${subResult.error}`,
+      );
+    }
+
+    Object.assign(state, subResult.state);
+    return { output: value };
   }
 
   // ---- do: condition ------------------------------------------------------------

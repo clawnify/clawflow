@@ -71,10 +71,12 @@ describe("FlowRunner — branch node", () => {
         { name: "set-val", do: "code" as const, run: "'yes'", output: "answer" },
         {
           name: "route", do: "branch" as const, on: "answer",
-          paths: { yes: "on-yes", no: "on-no" }, default: "on-no",
+          paths: {
+            yes: [{ name: "on-yes", do: "code" as const, run: "'took yes path'", output: "picked" }],
+            no: [{ name: "on-no", do: "code" as const, run: "'took no path'", output: "picked" }],
+          },
+          default: [{ name: "on-default", do: "code" as const, run: "'took no path'", output: "picked" }],
         },
-        { name: "on-no", do: "code" as const, run: "'took no path'", output: "picked" },
-        { name: "on-yes", do: "code" as const, run: "'took yes path'", output: "picked" },
       ],
     };
     const runner = new FlowRunner(cfg);
@@ -84,23 +86,49 @@ describe("FlowRunner — branch node", () => {
   });
 
   it("follows default path", async () => {
-    // Branch targets must be the last node in a branch path since execution
-    // continues sequentially from the jump target. Place default last.
     const flow: FlowDefinition = {
       flow: "test-branch-default",
       nodes: [
         { name: "set-val", do: "code" as const, run: "'maybe'", output: "answer" },
         {
           name: "route", do: "branch" as const, on: "answer",
-          paths: { yes: "on-yes" }, default: "on-default",
+          paths: {
+            yes: [{ name: "on-yes", do: "code" as const, run: "'yes path'", output: "picked" }],
+          },
+          default: [{ name: "on-default", do: "code" as const, run: "'default path'", output: "picked" }],
         },
-        { name: "on-yes", do: "code" as const, run: "'yes path'", output: "picked" },
-        { name: "on-default", do: "code" as const, run: "'default path'", output: "picked" },
       ],
     };
     const runner = new FlowRunner(cfg);
     const result = await runner.run(flow, {});
     assert.equal(result.state.picked, "default path");
+  });
+
+  it("runs multi-step sub-flow in branch path", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-branch-subflow",
+      nodes: [
+        { name: "set-val", do: "code" as const, run: "'billing'", output: "category" },
+        {
+          name: "route", do: "branch" as const, on: "category",
+          paths: {
+            billing: [
+              { name: "step1", do: "code" as const, run: "'looked up invoice'", output: "info" },
+              { name: "step2", do: "code" as const, run: "`${state.info} and refunded`", output: "result" },
+            ],
+            technical: [
+              { name: "tech", do: "code" as const, run: "'escalated'", output: "result" },
+            ],
+          },
+        },
+        { name: "after", do: "code" as const, run: "'done'", output: "final" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    assert.equal(result.state.result, "looked up invoice and refunded");
+    assert.equal(result.state.final, "done");
   });
 });
 

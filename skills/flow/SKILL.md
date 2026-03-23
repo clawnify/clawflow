@@ -24,7 +24,7 @@ A flow is JSON with a `flow` name and a `nodes` array. Call `flow_run` with the 
 |------|---------|------------|
 | `ai` | Single LLM call, structured or freeform | `prompt`, `schema`, `model`, `input` |
 | `agent` | Delegate to a real OpenClaw agent (with tools, browser, etc.) | `task`, `agent`, `tools`, `model` |
-| `branch` | Jump to a named node based on a value | `on`, `paths`, `default` |
+| `branch` | Multi-way routing with inline sub-flows per path | `on`, `paths`, `default` |
 | `condition` | If/else with sub-node blocks that reconverge | `if`, `then`, `else` |
 | `loop` | Iterate over an array | `over`, `as`, `nodes` |
 | `parallel` | Run nodes concurrently | `nodes`, `mode: "all"\|"race"` |
@@ -44,7 +44,7 @@ A flow is JSON with a `flow` name and a `nodes` array. Call `flow_run` with the 
 - Use `do: ai` for structured extraction and single-turn LLM calls
 - Set `agent: "ops"` on agent nodes to target a specific OpenClaw agent ID
 - `do: wait` with `for: approval` pauses for human review before side effects
-- `do: condition` runs inline then/else blocks and merges back (unlike `branch` which jumps)
+- `do: condition` for boolean if/else, `do: branch` for multi-way value matching — both run inline sub-flows and reconverge
 - Model shorthands: `fast` (Haiku), `smart` (Sonnet), `best` (Opus)
 
 ### Templates
