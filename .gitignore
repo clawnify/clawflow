@@ -5,3 +5,6 @@ dist/
 
 # Flow runtime state (local dev only)
 .openclaw/
+
+# Internal docs, roadmap, competitive analysis (not for public repo)
+.internal/

@@ -9,15 +9,9 @@
 
 ## The Problem
 
-Every agent framework today makes the same mistake: workflows are written **for** agents, not **by** them.
+Workflows today are written **for** agents, not **by** them. Visual canvas tools require humans to click nodes. Code-first orchestration frameworks have too much surface area for LLMs to generate reliably.
 
-- **n8n** — beautiful visual canvas, but humans click nodes together. Agents can't write n8n workflows reliably.
-- **Lobster** (OpenClaw) — deterministic CLI pipe runner. Great for shell scripts, wrong shape for AI-first workflows.
-- **LangGraph** — graph state machines in Python. Powerful, but the syntax surface is too large for LLMs to generate reliably.
-- **Cloudflare Workflows** — TypeScript classes with durable execution. Excellent runtime, but code-first — agents hallucinate class structure.
-- **Temporal / Prefect / Airflow** — enterprise-grade orchestration, massive surface area, not designed for agent authorship.
-
-None of them answer the core question: **what if the agent itself needs to design, build, and modify the workflow?**
+**What if the agent itself could design, build, and modify the workflow?**
 
 ---
 
@@ -43,8 +37,8 @@ clawflow/
 ├── Format Spec         The .flow JSON/YAML definition language
 ├── OpenClaw Plugin     Run flows inside OpenClaw as agent tools (today)
 ├── Cloudflare Runtime  Transpile flows to Workers + Durable Objects (next)
-├── Standalone Runner   Node.js server for self-hosted deployment (future)
-└── Flow Registry       Shareable, reusable community flow library (future)
+├── Standalone Runner   Node.js server for self-hosted deployment
+└── Flow Registry       Shareable, reusable community flow library
 ```
 
 ---
@@ -480,9 +474,12 @@ Five tools registered in OpenClaw:
 
 **Install:**
 ```bash
-git clone https://github.com/clawnify/clawflow.git
-cd clawflow && npm install && npm run build
-openclaw plugins install --link ./clawflow
+npm install @clawnify/clawflow
+```
+
+**Or as an OpenClaw plugin:**
+```bash
+openclaw plugins install @clawnify/clawflow
 ```
 
 **Config:**
@@ -533,7 +530,7 @@ The transpiler gives you:
 
 ---
 
-### 3. Standalone Node.js Runner (planned)
+### 3. Standalone Node.js Runner (coming soon)
 
 A small HTTP server wrapping the runner. Expose flows as endpoints, receive webhooks, manage instances via REST API. Self-hosted alternative to Cloudflare.
 
@@ -547,9 +544,9 @@ GET   /flows/instances/:id   # get instance status
 
 ---
 
-### 4. Flow Registry (planned)
+### 4. Flow Registry (coming soon)
 
-A community library of reusable, shareable `.flow` definitions. Think npm for workflows — or n8n's template library, but agent-writable.
+A community library of reusable, shareable `.flow` definitions. Think npm for workflows — but agent-writable.
 
 ```
 clawflow install support-triage
@@ -608,66 +605,25 @@ Rules:
 
 ---
 
-## Comparison
+## What's Shipped (v0.2)
 
-| | n8n | LangGraph | Cloudflare Workflows | Lobster | clawflow |
-|---|---|---|---|---|---|
-| AI nodes first-class | ✗ | ✓ | ✗ | partial | ✓ |
-| Agent nodes | ✗ | ✓ | ✗ | ✗ | ✓ |
-| LLM can write it | ✗ | ✗ | ✗ | partial | ✓ |
-| Human readable | ✓ | ✗ | ✗ | partial | ✓ |
-| Visual canvas | ✓ | ✗ | ✓ | ✗ | roadmap |
-| Durable execution | ✗ | ✗ | ✓ | ✗ | ✓ (file) / ✓ (CF) |
-| Per-step retry | ✓ | ✗ | ✓ | ✗ | ✓ |
-| waitForEvent | ✗ | ✗ | ✓ | ✗ | ✓ |
-| Parallel branches | ✓ | ✓ | ✓ | ✗ | ✓ |
-| Runtime portable | ✗ | ✗ | ✗ | ✗ | ✓ |
-| Self-hostable | ✓ | ✓ | ✗ | ✓ | ✓ |
-| Cloud-native | ✗ | ✗ | ✓ | ✗ | ✓ (via transpile) |
+- 11 node types: ai, agent, branch, condition, loop, parallel, http, memory, wait, sleep, code
+- Static flow validation before execution
+- `do: agent` delegates to real OpenClaw agents
+- `do: branch` and `do: condition` with inline sub-flows and automatic reconvergence
+- Per-node retry with exponential/linear/constant backoff
+- `waitForEvent` — external systems push events into waiting flows
+- Durable state: memoized node outputs persist across restarts
+- Cloudflare transpiler — convert flows to `WorkflowEntrypoint` TypeScript
+- Plugin ships a skill (SKILL.md) so agents know how to write flows
 
----
+## What's Next
 
-## Roadmap
-
-### v0.2 — Current (OpenClaw plugin)
-- [x] 10 node types: ai, agent, branch, condition, loop, parallel, http, memory, wait, sleep, code
-- [x] `do: agent` delegates to real OpenClaw agents via CLI (browser, exec, memory)
-- [x] `do: condition` — if/else blocks that reconverge into the main flow
-- [x] Auto-detect OpenClaw gateway for AI calls (OpenRouter, Anthropic, OpenAI fallbacks)
-- [x] Plugin ships a skill (SKILL.md) so agents know how to write flows
-- [x] Per-node retry with exponential/linear/constant backoff
-- [x] `waitForEvent` — external systems push events into waiting flows
-- [x] Durable state: memoized node outputs persist across restarts
-- [x] `flow_send_event` tool — Cloudflare `sendEvent` equivalent
-- [x] `flow_status` tool — inspect any instance
-- [x] Cloudflare transpiler — convert flows to `WorkflowEntrypoint` TypeScript
-
-### v0.3 — Standalone runner
-- [ ] HTTP server: REST API for flow management
-- [ ] Webhook receiver: flows triggered by inbound HTTP
-- [ ] Cron trigger: flows triggered by schedule
-- [ ] Postgres/SQLite state backend (replace file-based store)
-- [ ] Retry dead-letter queue: inspect and replay failed nodes
-
-### v0.4 — Agent integration
-- [ ] OpenClaw `sessions_spawn` wiring for true `do: agent` sub-agent delegation
-- [ ] Flow introspection: agent can read its own running flow state mid-execution
-- [ ] Dynamic node insertion: agent can append nodes to a running flow
-- [ ] Flow forking: branch a running instance into two parallel variations
-
-### v0.5 — Observability
-- [ ] Structured trace log (JSONL) per instance
-- [ ] Web UI: simple dashboard showing instances, traces, waiting queues
-- [ ] Token usage tracking per `do: ai` node
-- [ ] Cost estimation before run
-
-### v1.0 — Registry and ecosystem
-- [ ] `clawflow install <name>` — install community flows
-- [ ] `clawflow publish <file>` — publish to registry
-- [ ] Flow validation: `clawflow validate <file>` — check for dead paths, missing outputs, invalid references
-- [ ] YAML support in addition to JSON
-- [ ] TypeScript type generation from flow schema fields
-- [ ] Visual canvas (read-only at first — render a flow as a diagram)
+- Standalone HTTP runner (self-hosted, no OpenClaw dependency)
+- Webhook and cron triggers
+- Observability: structured traces, token tracking
+- Flow registry: shareable, reusable community flows
+- Visual canvas
 
 ---
 
@@ -684,7 +640,7 @@ Rules:
     ┌──────▼──────┐    ┌───────▼──────┐   ┌────────▼───────┐
     │  OpenClaw   │    │  Cloudflare  │   │   Standalone   │
     │   Plugin    │    │   Workers    │   │  Node Server   │
-    │             │    │   (via       │   │   (planned)    │
+    │             │    │   (via       │   │   (coming soon)    │
     │ flow_run    │    │  transpiler) │   │                │
     │ flow_resume │    │              │   │ REST API       │
     │ flow_status │    │ step.do()    │   │ Webhook recv   │
@@ -709,18 +665,6 @@ Rules:
     │  execCode                           │
     └─────────────────────────────────────┘
 ```
-
----
-
-## Why This Becomes the n8n for Agents
-
-n8n won because it gave non-developers a way to wire together integrations visually. The market it created was enormous.
-
-The next version of that market isn't humans clicking nodes. It's agents designing their own automation. The inbox for agents is being built. The CRM for agents is being built. The workflow layer for agents hasn't been built yet.
-
-The gap isn't another visual canvas. It's a **format that agents can write**, combined with a **runtime that's durable enough to be trusted** with real business processes.
-
-clawflow is a bet that the format comes first. Get the spec right, build the OpenClaw plugin to validate it, transpile to Cloudflare to prove portability, build the registry to prove the ecosystem. The canvas comes last, once the format is stable — because at that point you're just rendering JSON you already understand.
 
 ---
 

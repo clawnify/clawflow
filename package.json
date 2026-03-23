@@ -3,25 +3,33 @@
   "version": "0.2.0",
   "description": "The n8n for agents. A declarative, AI-native workflow format that agents can read, write, and run.",
   "type": "module",
-  "main": "index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./index.ts"
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
     },
     "./core": {
-      "import": "./src/index.ts"
+      "import": "./dist/core/index.js",
+      "types": "./dist/core/index.d.ts"
     }
   },
   "scripts": {
     "build": "tsc",
-    "test": "node --test --loader tsx tests/*.test.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
     "lint": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
   },
   "openclaw": {
     "extensions": ["./index.ts"]
   },
   "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.js.map",
+    "dist/**/*.d.ts.map",
     "index.ts",
     "src/**/*.ts",
     "skills/**/*",
@@ -46,6 +54,11 @@
   "dependencies": {},
   "peerDependencies": {
     "openclaw": "*"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
