@@ -51,7 +51,7 @@ Workflows today are written **for** agents, not **by** them. Visual canvas tools
 
 ### AI-Native
 - **`do: ai`** — structured LLM calls with schema validation and model selection (`fast`, `smart`, `best`)
-- **`do: agent`** — delegate to real agents with full tool access (browser, exec, memory)
+- **`do: agent`** — delegate to real agents with full tool access (browser, exec, memory, MCP, CLI)
 - **Agent-writable** — any LLM can generate a valid flow from a natural language description
 
 ### Control Flow
@@ -189,7 +189,7 @@ The most important node. A single LLM call that returns structured or freeform o
 
 ### `do: agent` — delegate to a real agent
 
-Runs a task through a real OpenClaw agent with full tool access (browser, exec, memory, etc.). The agent decides its own path to a result.
+Runs a task through a real OpenClaw agent with full tool access (browser, exec, memory, MCP, CLI). The agent decides its own path to a result.
 
 ```json
 {
@@ -202,7 +202,7 @@ Runs a task through a real OpenClaw agent with full tool access (browser, exec, 
 }
 ```
 
-On OpenClaw, this delegates to `openclaw agent --agent <id> --message "..."`. The agent gets full tool access — browser, shell, file system, memory. Falls back to a single AI call if the CLI is unavailable (standalone mode).
+On OpenClaw, this delegates to `openclaw agent --agent <id> --message "..."`. The agent gets full tool access — browser, shell, file system, memory, MCP. Falls back to a single AI call if the CLI is unavailable (standalone mode).
 
 | Field | Description |
 |---|---|
