@@ -29,5 +29,6 @@ export type {
   WaitNode,
   SleepNode,
   CodeNode,
+  ExecNode,
 } from "./core/types.js";
 export { parseDuration, MODEL_MAP, DEFAULT_MODEL } from "./core/types.js";

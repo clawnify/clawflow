@@ -59,6 +59,83 @@ describe("FlowRunner — code node", () => {
   });
 });
 
+// ---- FlowRunner: exec node ------------------------------------------------------
+
+describe("FlowRunner — exec node", () => {
+  after(cleanup);
+
+  it("runs a shell command and captures stdout", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-exec",
+      nodes: [
+        { name: "echo-it", do: "exec" as const, command: "echo 'hello from exec'", output: "result" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    const out = result.state.result as { stdout: string; stderr: string; exitCode: number };
+    assert.equal(out.stdout, "hello from exec");
+    assert.equal(out.exitCode, 0);
+  });
+
+  it("resolves templates in command", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-exec-template",
+      nodes: [
+        { name: "run-it", do: "exec" as const, command: "echo '{{ trigger.msg }}'", output: "result" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, { msg: "templated" });
+    const out = result.state.result as { stdout: string; stderr: string; exitCode: number };
+    assert.equal(out.stdout, "templated");
+  });
+
+  it("captures non-zero exit code without throwing", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-exec-fail",
+      nodes: [
+        { name: "fail-it", do: "exec" as const, command: "exit 42", output: "result" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    const out = result.state.result as { stdout: string; stderr: string; exitCode: number };
+    assert.equal(out.exitCode, 42);
+  });
+
+  it("captures stderr", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-exec-stderr",
+      nodes: [
+        { name: "warn-it", do: "exec" as const, command: "echo 'err msg' >&2", output: "result" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    const out = result.state.result as { stdout: string; stderr: string; exitCode: number };
+    assert.equal(out.stderr, "err msg");
+  });
+
+  it("uses | json filter to pass objects to commands", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-exec-json-filter",
+      nodes: [
+        { name: "set-data", do: "code" as const, run: "({ x: 1, y: 2 })", output: "data" },
+        { name: "print-json", do: "exec" as const, command: "echo '{{ data | json }}'", output: "result" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    const out = result.state.result as { stdout: string };
+    assert.deepEqual(JSON.parse(out.stdout), { x: 1, y: 2 });
+  });
+});
+
 // ---- FlowRunner: branch node ----------------------------------------------------
 
 describe("FlowRunner — branch node", () => {
@@ -482,6 +559,11 @@ describe("template filters", () => {
     assert.equal(runner.resolveTemplate("{{ plan.title | tojson }}", state), "My Plan");
   });
 
+  it("json is an alias for tojson", () => {
+    assert.equal(runner.resolveTemplate("{{ plan.tags | json }}", state), '["a","b","c"]');
+    assert.equal(runner.resolveTemplate("{{ plan.title | json }}", state), "My Plan");
+  });
+
   it("upper converts to uppercase", () => {
     assert.equal(runner.resolveTemplate("{{ plan.title | upper }}", state), "MY PLAN");
   });
@@ -669,6 +751,29 @@ describe("validateFlow", () => {
       flow: "trigger-ref",
       nodes: [
         { name: "greet", do: "ai" as const, prompt: "Hello {{ trigger.name }}", output: "msg" },
+      ],
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, true);
+  });
+
+  it("validates exec node requires command", () => {
+    const flow: FlowDefinition = {
+      flow: "bad-exec",
+      nodes: [
+        { name: "bad", do: "exec" as const, command: "" } as any,
+      ],
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((e) => e.message.includes("requires")));
+  });
+
+  it("validates exec node template refs", () => {
+    const flow: FlowDefinition = {
+      flow: "exec-ref",
+      nodes: [
+        { name: "run", do: "exec" as const, command: "echo '{{ trigger.x }}'", output: "out" },
       ],
     };
     const result = validateFlow(flow);

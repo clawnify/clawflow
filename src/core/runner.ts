@@ -24,6 +24,7 @@ import {
   WaitNode,
   SleepNode,
   CodeNode,
+  ExecNode,
   parseDuration,
 } from "./types.js";
 import { StateStore } from "./store.js";
@@ -59,6 +60,7 @@ export function sendEvent(
 
 function applyFilter(val: unknown, filter: string): unknown {
   switch (filter) {
+    case "json":
     case "tojson":
       return typeof val === "string" ? val : JSON.stringify(val);
     case "upper":
@@ -381,6 +383,8 @@ export class FlowRunner {
         return this.execSleep(node as SleepNode);
       case "code":
         return this.execCode(node as CodeNode, state);
+      case "exec":
+        return this.execExec(node as ExecNode, state);
       default:
         throw new Error(`Unknown node type: "${(node as FlowNode & { do: string }).do}"`);
     }
@@ -1124,6 +1128,47 @@ export class FlowRunner {
       `"use strict"; return (${node.run});`,
     );
     return { output: fn(input, state) };
+  }
+
+  // ---- do: exec ----------------------------------------------------------------
+  // Runs a shell command deterministically. No AI involved.
+
+  private async execExec(
+    node: ExecNode,
+    state: FlowState,
+  ): Promise<{ output: unknown }> {
+    const { exec } = await import("child_process");
+    const { promisify } = await import("util");
+    const execAsync = promisify(exec);
+
+    const command = this.resolveTemplate(node.command, state);
+    const cwd = node.cwd ? this.resolveTemplate(node.cwd, state) : undefined;
+
+    try {
+      const { stdout, stderr } = await execAsync(command, {
+        timeout: node.timeout
+          ? parseDuration(node.timeout)
+          : (this.cfg.maxNodeDurationMs ?? 30_000),
+        maxBuffer: 10 * 1024 * 1024, // 10MB
+        cwd,
+      });
+      return {
+        output: { stdout: stdout.trimEnd(), stderr: stderr.trimEnd(), exitCode: 0 },
+      };
+    } catch (err: unknown) {
+      const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
+      // Non-zero exit is not a runtime error — return the result with exitCode
+      if (e.code != null && e.stdout !== undefined) {
+        return {
+          output: {
+            stdout: (e.stdout ?? "").trimEnd(),
+            stderr: (e.stderr ?? "").trimEnd(),
+            exitCode: e.code,
+          },
+        };
+      }
+      throw new Error(`exec "${node.name}" failed: ${e.message ?? String(err)}`);
+    }
   }
 
   // ---- Template helpers ---------------------------------------------------------

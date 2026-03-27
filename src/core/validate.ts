@@ -12,6 +12,7 @@ import type {
   WaitNode,
   SleepNode,
   CodeNode,
+  ExecNode,
 } from "./types.js";
 
 // ---- Flow Validator -------------------------------------------------------------
@@ -233,6 +234,11 @@ function validateNodeFields(node: FlowNode, errors: ValidationError[]): void {
       if (!n.run) e("run", `code node "${node.name}" requires "run"`);
       break;
     }
+    case "exec": {
+      const n = node as ExecNode;
+      if (!n.command) e("command", `exec node "${node.name}" requires "command"`);
+      break;
+    }
     default:
       errors.push({
         node: node.name,
@@ -373,7 +379,7 @@ function validateSubFlows(
 function collectStringFields(node: FlowNode): { field: string; value: string }[] {
   const result: { field: string; value: string }[] = [];
   // Fields that contain template-interpolated strings
-  const templateFields = ["prompt", "task", "url", "key", "value", "run", "body", "if"];
+  const templateFields = ["prompt", "task", "url", "key", "value", "run", "body", "if", "command", "cwd"];
 
   for (const field of templateFields) {
     const val = (node as unknown as Record<string, unknown>)[field];

@@ -45,7 +45,8 @@ export type FlowNode =
   | MemoryNode
   | WaitNode
   | SleepNode
-  | CodeNode;
+  | CodeNode
+  | ExecNode;
 
 export interface BaseNode {
   name: string;
@@ -128,6 +129,23 @@ export interface CodeNode extends BaseNode {
   do: "code";
   run: string;
   input?: string;
+}
+
+/**
+ * exec — run a shell command deterministically, no AI involved.
+ * Templates in `command` are resolved before execution.
+ * Output: { stdout: string, stderr: string, exitCode: number }
+ *
+ * Example:
+ *   - name: build-pdf
+ *     do: exec
+ *     command: "python3 /path/fill_foglio.py '{{ pdfPath }}' '{{ sheet | json }}'"
+ *     output: buildResult
+ */
+export interface ExecNode extends BaseNode {
+  do: "exec";
+  command: string;
+  cwd?: string; // working directory (resolved via templates)
 }
 
 /**

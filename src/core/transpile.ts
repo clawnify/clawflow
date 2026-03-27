@@ -12,6 +12,7 @@ import type {
   WaitNode,
   SleepNode,
   CodeNode,
+  ExecNode,
   BaseNode,
 } from "./types.js";
 
@@ -43,6 +44,7 @@ type Params = {
 // Template filters
 function applyFilter(val: unknown, filter: string): unknown {
   switch (filter) {
+    case "json":
     case "tojson": return typeof val === "string" ? val : JSON.stringify(val);
     case "upper": return String(val).toUpperCase();
     case "lower": return String(val).toLowerCase();
@@ -259,6 +261,31 @@ ${pad}});${outputLine}`;
 ${pad}  const input = ${inputExpr};
 ${pad}  return (${n.run});
 ${pad}})();${outputLine}`;
+    }
+
+    case "exec": {
+      const n = node as ExecNode;
+      const outputLine = n.output
+        ? `\n${pad}state["${n.output}"] = ${camel(node.name)};`
+        : "";
+      const cwdLine = n.cwd
+        ? `\n${pad}  const cwd = resolveTemplate(state, ${JSON.stringify(n.cwd)});`
+        : "";
+      return `${pad}const ${camel(node.name)} = await step.do("${node.name}"${retryConfig}, async () => {
+${pad}  const { exec } = await import("child_process");
+${pad}  const { promisify } = await import("util");
+${pad}  const execAsync = promisify(exec);
+${pad}  const command = resolveTemplate(state, ${JSON.stringify(n.command)});${cwdLine}
+${pad}  try {
+${pad}    const { stdout, stderr } = await execAsync(command${n.cwd ? ", { cwd }" : ""});
+${pad}    return { stdout: stdout.trimEnd(), stderr: stderr.trimEnd(), exitCode: 0 };
+${pad}  } catch (e: any) {
+${pad}    if (e.code != null && e.stdout !== undefined) {
+${pad}      return { stdout: (e.stdout ?? "").trimEnd(), stderr: (e.stderr ?? "").trimEnd(), exitCode: e.code };
+${pad}    }
+${pad}    throw e;
+${pad}  }
+${pad}});${outputLine}`;
     }
 
     default:
