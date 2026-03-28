@@ -15,7 +15,6 @@ import {
   RetryPolicy,
   AiNode,
   AgentNode,
-  ApproveNode,
   BranchNode,
   ConditionNode,
   LoopNode,
@@ -172,7 +171,9 @@ export class FlowRunner {
     // Memoize the paused node with the approval payload and set in state
     const pausedNode = flow.nodes[pausedAtIndex];
     if (pausedNode) {
-      const approvalOutput = pausedNode.do === "approve"
+      const isApproval = pausedNode.do === "wait"
+        && (pausedNode as WaitNode).for === "approval";
+      const approvalOutput = isApproval
         ? { approved: true, approvedAt: new Date().toISOString(), token }
         : approvedOrPayload;
       this.store.memoize(instanceId, pausedNode.name, approvalOutput);
@@ -238,45 +239,7 @@ export class FlowRunner {
       try {
         const result = await this.runWithRetry(node, state, flow, instanceId);
 
-        // ---- Paused for approval (do: wait with for: approval) ------------------
-        if (result.pause) {
-          const waitNode = node as WaitNode;
-          const entry: TraceEntry = {
-            node: node.name,
-            do: node.do,
-            status: "paused",
-            durationMs: Date.now() - t0,
-          };
-          trace.push(entry);
-          this.store.update(instanceId, {
-            status: waitNode.for === "event" ? "waiting" : "paused",
-            state,
-            trace,
-            pausedAtIndex: i,
-            resumeToken: instanceId,
-            waitingFor: {
-              type: waitNode.for,
-              event: waitNode.event,
-              prompt: waitNode.prompt
-                ? this.resolveTemplate(waitNode.prompt, state)
-                : `Approve node "${node.name}"?`,
-              timeout: waitNode.timeout,
-            },
-          });
-          return {
-            ok: true,
-            status: waitNode.for === "event" ? "waiting" : "paused",
-            flowName: flow.flow,
-            instanceId,
-            state,
-            trace,
-            pausedAt: node.name,
-            resumeToken: instanceId,
-            waitingFor: this.store.get(instanceId)?.waitingFor,
-          };
-        }
-
-        // ---- Paused for approve node -------------------------------------------
+        // ---- Paused for approval (do: wait, for: approval) ----------------------
         if (result.approve) {
           const entry: TraceEntry = {
             node: node.name,
@@ -373,7 +336,6 @@ export class FlowRunner {
     instanceId: string,
   ): Promise<{
     output?: unknown;
-    pause?: boolean;
     approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
     attempts?: number;
   }> {
@@ -430,7 +392,6 @@ export class FlowRunner {
     instanceId: string,
   ): Promise<{
     output?: unknown;
-    pause?: boolean;
     approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
   }> {
     switch (node.do) {
@@ -438,8 +399,6 @@ export class FlowRunner {
         return this.execAi(node as AiNode, state);
       case "agent":
         return this.execAgent(node as AgentNode, state);
-      case "approve":
-        return this.execApprove(node as ApproveNode, state, flow, instanceId);
       case "branch":
         return this.execBranch(node as BranchNode, state, flow, instanceId);
       case "condition":
@@ -463,7 +422,7 @@ export class FlowRunner {
       case "memory":
         return this.execMemory(node as MemoryNode, state);
       case "wait":
-        return this.execWait(node as WaitNode, state, instanceId);
+        return this.execWait(node as WaitNode, state, flow, instanceId);
       case "sleep":
         return this.execSleep(node as SleepNode);
       case "code":
@@ -1146,18 +1105,52 @@ export class FlowRunner {
 
   // ---- do: wait -----------------------------------------------------------------
   // Two modes:
-  //   for: approval -> pause and return resume token (human approves)
+  //   for: approval -> human-in-the-loop gate with token, preview, registry
   //   for: event    -> register on eventBus and await sendEvent() call
 
   private async execWait(
     node: WaitNode,
     state: FlowState,
+    flow: FlowDefinition,
     instanceId: string,
-  ): Promise<{ output?: unknown; pause?: boolean }> {
+  ): Promise<{
+    output?: unknown;
+    pause?: boolean;
+    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
+  }> {
     if (node.for === "approval") {
+      const prompt = node.prompt
+        ? this.resolveTemplate(node.prompt, state)
+        : `Approve node "${node.name}"?`;
+      const timeout = node.timeout ?? "24h";
+      const expiresAt = new Date(
+        Date.now() + parseDuration(timeout),
+      ).toISOString();
+
+      // Resolve preview data if specified
+      let preview: unknown;
+      if (node.preview) {
+        const previewExpr = node.preview.includes("{{")
+          ? node.preview
+          : `{{ ${node.preview} }}`;
+        preview = this.resolveBodyObject(previewExpr, state);
+      }
+
+      // Generate approval token and register
+      const token = `cf-${crypto.randomUUID().slice(0, 8)}`;
+      this.store.addApproval({
+        token,
+        instanceId,
+        flowName: flow.flow,
+        node: node.name,
+        prompt,
+        preview,
+        createdAt: new Date().toISOString(),
+        expiresAt,
+      });
+
       return {
-        output: { waitType: "approval", prompt: node.prompt },
-        pause: true,
+        approve: { token, prompt, preview, timeout },
       };
     }
 
@@ -1213,53 +1206,6 @@ export class FlowRunner {
       `"use strict"; return (${node.run});`,
     );
     return { output: fn(input, state) };
-  }
-
-  // ---- do: approve --------------------------------------------------------------
-  // Human-in-the-loop gate with token-based resume.
-
-  private async execApprove(
-    node: ApproveNode,
-    state: FlowState,
-    flow: FlowDefinition,
-    instanceId: string,
-  ): Promise<{
-    approve: { token: string; prompt: string; preview?: unknown; timeout?: string };
-  }> {
-    const prompt = this.resolveTemplate(node.prompt, state);
-    const timeout = node.timeout ?? "24h";
-    const expiresAt = new Date(
-      Date.now() + parseDuration(timeout),
-    ).toISOString();
-
-    // Resolve preview data: supports dotted paths, wildcards, and template syntax
-    let preview: unknown;
-    if (node.preview) {
-      // Wrap bare paths in {{ }} so resolveBodyObject handles them
-      const previewExpr = node.preview.includes("{{")
-        ? node.preview
-        : `{{ ${node.preview} }}`;
-      preview = this.resolveBodyObject(previewExpr, state);
-    }
-
-    // Generate a short approval token
-    const token = `cf-${crypto.randomUUID().slice(0, 8)}`;
-
-    // Register in pending approvals
-    this.store.addApproval({
-      token,
-      instanceId,
-      flowName: flow.flow,
-      node: node.name,
-      prompt,
-      preview,
-      createdAt: new Date().toISOString(),
-      expiresAt,
-    });
-
-    return {
-      approve: { token, prompt, preview, timeout },
-    };
   }
 
   // ---- do: exec ----------------------------------------------------------------

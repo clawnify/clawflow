@@ -24,7 +24,6 @@ A flow is JSON with a `flow` name and a `nodes` array. Call `flow_run` with the 
 |------|---------|------------|
 | `ai` | Single LLM call, structured or freeform | `prompt`, `schema`, `model`, `input` |
 | `agent` | Delegate to a real OpenClaw agent (with tools, browser, etc.) | `task`, `agent`, `tools`, `model` |
-| `approve` | Human-in-the-loop gate — pauses for approval with token | `prompt`, `preview`, `timeout` |
 | `exec` | Run a shell command deterministically (no AI) | `command`, `cwd` |
 | `branch` | Multi-way routing with inline sub-flows per path | `on`, `paths`, `default` |
 | `condition` | If/else with sub-node blocks that reconverge | `if`, `then`, `else` |
@@ -32,7 +31,7 @@ A flow is JSON with a `flow` name and a `nodes` array. Call `flow_run` with the 
 | `parallel` | Run nodes concurrently | `nodes`, `mode: "all"\|"race"` |
 | `http` | Call an external API | `url`, `method`, `body`, `headers` |
 | `memory` | Persistent key/value store | `action: "read"\|"write"\|"delete"`, `key` |
-| `wait` | Wait for an external event | `for: "event"`, `event`, `timeout` |
+| `wait` | Human approval gate or external event wait | `for: "approval"\|"event"`, `prompt`, `preview`, `timeout` |
 | `sleep` | Pause for a duration | `duration: "5m"` |
 | `code` | Inline JS expression | `run`, `input` |
 
@@ -47,8 +46,8 @@ A flow is JSON with a `flow` name and a `nodes` array. Call `flow_run` with the 
 - Use `do: agent` for tasks that need tools (browser, exec, memory, MCP, CLI) — delegates to a real OpenClaw agent
 - Use `do: ai` for structured extraction and single-turn LLM calls
 - Set `agent: "ops"` on agent nodes to target a specific OpenClaw agent ID
-- Use `do: approve` before any side effects that need human review — it pauses the flow and provides a token for resume
-- `do: wait` with `for: event` waits for external events (webhooks, signals)
+- Use `do: wait` with `for: approval` before any side effects that need human review — it pauses the flow, provides a token, and shows preview data to the approver
+- Use `do: wait` with `for: event` to wait for external events (webhooks, signals)
 - `do: condition` for boolean if/else, `do: branch` for multi-way value matching — both run inline sub-flows and reconverge
 - Model shorthands: `fast` (Gemini 3 Flash), `smart` (Claude Sonnet 4.6), `best` (Minimax M2.5)
 
@@ -109,14 +108,15 @@ Runs a command with no AI involved. Returns `{ stdout, stderr, exitCode }`. Non-
 - Both `command` and `cwd` support template resolution
 - Use ternary for conditional script selection: `"command": "python3 script{{ type == 'special' ? '_special' : '' }}.py"`
 
-### do: approve — human-in-the-loop gate
+### do: wait — approval gates and event waiting
 
-Pauses the flow for human approval. Returns a token that can be used to resume or cancel.
+**for: approval** — pauses the flow for human review. Returns a token for resume.
 
 ```json
 {
   "name": "review-pdfs",
-  "do": "approve",
+  "do": "wait",
+  "for": "approval",
   "prompt": "Review generated PDFs for {{ parsed.client_name }}",
   "preview": "process_sheets[*].pdfPath",
   "timeout": "24h",
@@ -132,7 +132,20 @@ Pauses the flow for human approval. Returns a token that can be used to resume o
 - All pending approvals are tracked in a registry file and can be listed via `flow_status`
 - Pre-approval trace (logs) is preserved — resume continues from where it stopped, not from scratch
 
-**Always place `approve` before irreversible side effects** (sending emails, calling external APIs, deleting data).
+**Always place `wait for: approval` before irreversible side effects** (sending emails, calling external APIs, deleting data).
+
+**for: event** — waits for an external event (webhook, signal).
+
+```json
+{
+  "name": "wait-payment",
+  "do": "wait",
+  "for": "event",
+  "event": "stripe-webhook",
+  "timeout": "1h",
+  "output": "payment"
+}
+```
 
 ### do: loop — iterating with output
 
@@ -240,7 +253,8 @@ extract (agent) → parse (ai+schema) → loop:
     },
     {
       "name": "review",
-      "do": "approve",
+      "do": "wait",
+      "for": "approval",
       "prompt": "Review this post before publishing:\n\n{{ draft.post }}\n\nHashtags: {{ draft.hashtags }}"
     },
     {

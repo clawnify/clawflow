@@ -3,7 +3,6 @@ import type {
   FlowNode,
   AiNode,
   AgentNode,
-  ApproveNode,
   BranchNode,
   ConditionNode,
   LoopNode,
@@ -160,11 +159,6 @@ function validateNodeFields(node: FlowNode, errors: ValidationError[]): void {
     case "agent": {
       const n = node as AgentNode;
       if (!n.task) e("task", `agent node "${node.name}" requires "task"`);
-      break;
-    }
-    case "approve": {
-      const n = node as ApproveNode;
-      if (!n.prompt) e("prompt", `approve node "${node.name}" requires "prompt"`);
       break;
     }
     case "branch": {

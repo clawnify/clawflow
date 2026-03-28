@@ -37,7 +37,6 @@ export interface RetryPolicy {
 export type FlowNode =
   | AiNode
   | AgentNode
-  | ApproveNode
   | BranchNode
   | ConditionNode
   | LoopNode
@@ -78,29 +77,6 @@ export interface AgentNode extends BaseNode {
   agent?: string;
 }
 
-/**
- * approve — human-in-the-loop gate with token-based resume.
- * Pauses the flow, registers a pending approval, and waits for
- * a human to approve or deny via token.
- *
- * Output on approval: { approved: true, approvedAt: string, token: string }
- * Output on denial:   flow is cancelled.
- *
- * Example:
- *   - name: review-pdfs
- *     do: approve
- *     prompt: "Review generated PDFs for {{ parsed.client_name }}"
- *     preview: "process_sheets[*].pdfPath"
- *     timeout: "24h"
- *     output: approval
- */
-export interface ApproveNode extends BaseNode {
-  do: "approve";
-  prompt: string; // shown to approver (supports templates)
-  preview?: string; // dotted path or wildcard to data shown alongside prompt
-  timeout?: string; // expiry e.g. "24h" (default: 24h)
-}
-
 export interface BranchNode extends BaseNode {
   do: "branch";
   on: string; // dotted path in flow state
@@ -136,10 +112,30 @@ export interface MemoryNode extends BaseNode {
   value?: string; // required for write
 }
 
+/**
+ * wait — pause for human approval or external event.
+ *
+ * for: "approval" — human-in-the-loop gate with token-based resume.
+ *   Registers a pending approval, provides a token for resume.
+ *   On approval: output = { approved: true, approvedAt: string, token: string }
+ *   On denial: flow is cancelled.
+ *
+ * for: "event" — wait for an external event (webhook, signal).
+ *
+ * Example:
+ *   - name: review-pdfs
+ *     do: wait
+ *     for: approval
+ *     prompt: "Review generated PDFs for {{ parsed.client_name }}"
+ *     preview: "process_sheets[*].pdfPath"
+ *     timeout: "24h"
+ *     output: approval
+ */
 export interface WaitNode extends BaseNode {
   do: "wait";
   for: "approval" | "event";
-  prompt?: string; // shown for approval gates
+  prompt?: string; // shown for approval gates (supports templates)
+  preview?: string; // dotted path or wildcard to data shown alongside prompt (for: approval)
   event?: string; // event type to match (for: event)
   timeout?: string; // e.g. "24h", "5m" -- fail if exceeded
 }
