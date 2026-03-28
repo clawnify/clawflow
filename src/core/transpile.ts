@@ -13,6 +13,7 @@ import type {
   SleepNode,
   CodeNode,
   ExecNode,
+  ApproveNode,
   BaseNode,
 } from "./types.js";
 
@@ -288,6 +289,17 @@ ${pad}});${outputLine}`;
       return `${pad}const ${camel(node.name)} = await step.waitForEvent("${node.name}", {
 ${pad}  type: ${JSON.stringify(eventType)},
 ${pad}  timeout: "${n.timeout ?? "24 hours"}",
+${pad}});${outputLine}`;
+    }
+
+    case "approve": {
+      const n = node as ApproveNode;
+      const outputLine = n.output
+        ? `\n${pad}state["${n.output}"] = ${camel(node.name)};`
+        : "";
+      return `${pad}const ${camel(node.name)} = await step.waitForEvent("${node.name}", {
+${pad}  type: "approval",
+${pad}  timeout: "${n.timeout ?? "24h"}",
 ${pad}});${outputLine}`;
     }
 

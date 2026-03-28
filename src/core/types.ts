@@ -37,6 +37,7 @@ export interface RetryPolicy {
 export type FlowNode =
   | AiNode
   | AgentNode
+  | ApproveNode
   | BranchNode
   | ConditionNode
   | LoopNode
@@ -75,6 +76,29 @@ export interface AgentNode extends BaseNode {
   model?: string;
   /** OpenClaw agent ID to delegate to (e.g. "main", "ops"). Uses OpenClaw's default routing if omitted. */
   agent?: string;
+}
+
+/**
+ * approve — human-in-the-loop gate with token-based resume.
+ * Pauses the flow, registers a pending approval, and waits for
+ * a human to approve or deny via token.
+ *
+ * Output on approval: { approved: true, approvedAt: string, token: string }
+ * Output on denial:   flow is cancelled.
+ *
+ * Example:
+ *   - name: review-pdfs
+ *     do: approve
+ *     prompt: "Review generated PDFs for {{ parsed.client_name }}"
+ *     preview: "process_sheets[*].pdfPath"
+ *     timeout: "24h"
+ *     output: approval
+ */
+export interface ApproveNode extends BaseNode {
+  do: "approve";
+  prompt: string; // shown to approver (supports templates)
+  preview?: string; // dotted path or wildcard to data shown alongside prompt
+  timeout?: string; // expiry e.g. "24h" (default: 24h)
 }
 
 export interface BranchNode extends BaseNode {
@@ -225,16 +249,30 @@ export interface FlowResult {
   instanceId: string; // stable ID for this run
   state: FlowState;
   trace: TraceEntry[];
-  // Set when status = "paused" (approval) or "waiting" (event)
+  // Set when status = "paused" (approval/approve) or "waiting" (event)
   pausedAt?: string;
   resumeToken?: string;
   waitingFor?: {
     type: "approval" | "event";
     event?: string; // event type name if waiting for event
     prompt?: string;
+    preview?: unknown; // resolved preview data for approve nodes
     timeout?: string;
   };
   error?: string;
+}
+
+// ---- Pending Approval -----------------------------------------------------------
+
+export interface PendingApproval {
+  token: string; // short random token for resume
+  instanceId: string;
+  flowName: string;
+  node: string; // approve node name
+  prompt: string; // resolved prompt text
+  preview?: unknown; // resolved preview data
+  createdAt: string;
+  expiresAt: string;
 }
 
 // ---- Inference Function ---------------------------------------------------------

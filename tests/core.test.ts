@@ -383,6 +383,125 @@ describe("FlowRunner — parallel node", () => {
   });
 });
 
+// ---- FlowRunner: approve node ---------------------------------------------------
+
+describe("FlowRunner — approve node", () => {
+  after(cleanup);
+
+  it("pauses at approve gate with token and preview", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-approve",
+      nodes: [
+        { name: "prep", do: "code" as const, run: "({ files: ['/a.pdf', '/b.pdf'] })", output: "data" },
+        {
+          name: "review", do: "approve" as const,
+          prompt: "Review files for {{ trigger.client }}",
+          preview: "data.files",
+          output: "approval",
+        },
+        { name: "after", do: "code" as const, run: "'done'", output: "final" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const paused = await runner.run(flow, { client: "ACME" });
+
+    assert.equal(paused.status, "paused");
+    assert.ok(paused.resumeToken);
+    assert.ok(paused.resumeToken!.startsWith("cf-"));
+    assert.equal(paused.waitingFor?.type, "approval");
+    assert.equal(paused.waitingFor?.prompt, "Review files for ACME");
+    assert.deepEqual(paused.waitingFor?.preview, ["/a.pdf", "/b.pdf"]);
+
+    // Check pending approvals registry
+    const pending = runner.listApprovals();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].token, paused.resumeToken);
+    assert.equal(pending[0].flowName, "test-approve");
+    assert.equal(pending[0].node, "review");
+  });
+
+  it("resumes with token and preserves pre-approval trace", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-approve-resume",
+      nodes: [
+        { name: "step1", do: "code" as const, run: "'first'", output: "v1" },
+        { name: "gate", do: "approve" as const, prompt: "Approve?", output: "approval" },
+        { name: "step2", do: "code" as const, run: "'second'", output: "v2" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+
+    const paused = await runner.run(flow, {});
+    assert.equal(paused.status, "paused");
+    assert.equal(paused.state.v1, "first");
+
+    // Pre-approval trace should have step1 (ok) and gate (paused)
+    assert.equal(paused.trace.length, 2);
+    assert.equal(paused.trace[0].node, "step1");
+    assert.equal(paused.trace[0].status, "ok");
+    assert.ok(paused.trace[0].durationMs > 0 || paused.trace[0].durationMs === 0);
+    assert.equal(paused.trace[1].node, "gate");
+    assert.equal(paused.trace[1].status, "paused");
+
+    // Resume with the approve token
+    const resumed = await runner.resume(paused.resumeToken!, flow, true);
+    assert.equal(resumed.status, "completed");
+    assert.equal(resumed.state.v1, "first");
+    assert.equal(resumed.state.v2, "second");
+
+    // Trace should have all 3 entries with original timing preserved
+    assert.equal(resumed.trace.length, 3);
+    assert.equal(resumed.trace[0].node, "step1");
+    assert.equal(resumed.trace[0].status, "ok");
+    assert.equal(resumed.trace[1].node, "gate");
+    assert.equal(resumed.trace[1].status, "ok"); // updated from paused to ok
+    assert.equal(resumed.trace[2].node, "step2");
+    assert.equal(resumed.trace[2].status, "ok");
+
+    // Approval output should be stored
+    const approvalOutput = resumed.state.approval as { approved: boolean; approvedAt: string; token: string };
+    assert.equal(approvalOutput.approved, true);
+    assert.ok(approvalOutput.approvedAt);
+
+    // This approval's token should be resolved (removed from pending)
+    const remaining = runner.listApprovals().filter(a => a.token === paused.resumeToken);
+    assert.equal(remaining.length, 0);
+  });
+
+  it("cancels when denied and preserves trace", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-approve-cancel",
+      nodes: [
+        { name: "prep", do: "code" as const, run: "'done'", output: "v1" },
+        { name: "gate", do: "approve" as const, prompt: "Proceed?" },
+        { name: "after", do: "code" as const, run: "'should not run'", output: "v2" },
+      ],
+    };
+    const runner = new FlowRunner(cfg);
+    const paused = await runner.run(flow, {});
+    const cancelled = await runner.resume(paused.resumeToken!, flow, false);
+
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.state.v1, "done");
+    assert.equal(cancelled.state.v2, undefined);
+
+    // Trace should show prep ok, gate skipped
+    assert.equal(cancelled.trace.length, 2);
+    assert.equal(cancelled.trace[0].status, "ok");
+    assert.equal(cancelled.trace[1].status, "skipped");
+  });
+
+  it("validates approve node requires prompt", () => {
+    const flow: FlowDefinition = {
+      flow: "bad-approve",
+      nodes: [{ name: "bad", do: "approve" as const, prompt: "" } as any],
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((e) => e.message.includes("requires")));
+  });
+});
+
 // ---- FlowRunner: wait (approval) ------------------------------------------------
 
 describe("FlowRunner — wait for approval", () => {

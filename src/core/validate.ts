@@ -3,6 +3,7 @@ import type {
   FlowNode,
   AiNode,
   AgentNode,
+  ApproveNode,
   BranchNode,
   ConditionNode,
   LoopNode,
@@ -159,6 +160,11 @@ function validateNodeFields(node: FlowNode, errors: ValidationError[]): void {
     case "agent": {
       const n = node as AgentNode;
       if (!n.task) e("task", `agent node "${node.name}" requires "task"`);
+      break;
+    }
+    case "approve": {
+      const n = node as ApproveNode;
+      if (!n.prompt) e("prompt", `approve node "${node.name}" requires "prompt"`);
       break;
     }
     case "branch": {
@@ -410,7 +416,7 @@ function validateSubFlows(
 function collectStringFields(node: FlowNode): { field: string; value: string }[] {
   const result: { field: string; value: string }[] = [];
   // Fields that contain template-interpolated strings
-  const templateFields = ["prompt", "task", "url", "key", "value", "run", "body", "if", "command", "cwd"];
+  const templateFields = ["prompt", "task", "url", "key", "value", "run", "body", "if", "command", "cwd", "preview"];
 
   for (const field of templateFields) {
     const val = (node as unknown as Record<string, unknown>)[field];

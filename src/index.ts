@@ -20,6 +20,8 @@ export type {
   InferenceResult,
   AiNode,
   AgentNode,
+  ApproveNode,
+  PendingApproval,
   BranchNode,
   ConditionNode,
   LoopNode,

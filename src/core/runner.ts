@@ -15,6 +15,7 @@ import {
   RetryPolicy,
   AiNode,
   AgentNode,
+  ApproveNode,
   BranchNode,
   ConditionNode,
   LoopNode,
@@ -128,46 +129,75 @@ export class FlowRunner {
     flow: FlowDefinition,
     approvedOrPayload: boolean | unknown = true,
   ): Promise<FlowResult> {
-    const record = this.store.get(token);
+    // Token can be an instanceId (legacy wait nodes) or an approve token
+    let record = this.store.get(token);
+    let instanceId = token;
+
+    // Check if it's an approve token
+    if (!record) {
+      const approval = this.store.resolveApproval(token);
+      if (approval) {
+        record = this.store.get(approval.instanceId);
+        instanceId = approval.instanceId;
+      }
+    }
+
     if (!record) throw new Error(`Resume token not found: ${token}`);
     if (record.status !== "paused" && record.status !== "waiting") {
       throw new Error(
-        `Instance "${token}" is not paused (status: ${record.status})`,
+        `Instance "${instanceId}" is not paused (status: ${record.status})`,
       );
     }
 
+    // Retrieve stored trace from before pause
+    const storedTrace = record.trace ?? [];
+    const pausedAtIndex = record.pausedAtIndex ?? 0;
+
     if (typeof approvedOrPayload === "boolean" && !approvedOrPayload) {
-      this.store.update(token, { status: "cancelled" });
+      // Update the paused trace entry to "skipped"
+      const pausedEntry = storedTrace.find((t) => t.status === "paused");
+      if (pausedEntry) pausedEntry.status = "skipped";
+      this.store.update(instanceId, { status: "cancelled", trace: storedTrace });
       return {
         ok: true,
         status: "cancelled",
         flowName: record.flowName,
-        instanceId: token,
+        instanceId,
         state: record.state,
-        trace: [],
+        trace: storedTrace,
         error: "Flow cancelled at approval gate",
       };
     }
 
-    // Memoize the paused/waiting node so it's skipped on re-execution
-    const waitingFor = record.waitingFor;
-    if (waitingFor) {
-      const pausedNode = flow.nodes.find(
-        (n) => n.do === "wait" && !record.completedNodes[n.name],
+    // Memoize the paused node with the approval payload and set in state
+    const pausedNode = flow.nodes[pausedAtIndex];
+    if (pausedNode) {
+      const approvalOutput = pausedNode.do === "approve"
+        ? { approved: true, approvedAt: new Date().toISOString(), token }
+        : approvedOrPayload;
+      this.store.memoize(instanceId, pausedNode.name, approvalOutput);
+      if (pausedNode.output) record.state[pausedNode.output] = approvalOutput;
+
+      // Update the paused trace entry to "ok"
+      const pausedEntry = storedTrace.find(
+        (t) => t.node === pausedNode.name && t.status === "paused",
       );
-      if (pausedNode) {
-        this.store.memoize(token, pausedNode.name, approvedOrPayload);
+      if (pausedEntry) {
+        pausedEntry.status = "ok";
+        pausedEntry.output = approvalOutput;
       }
     }
 
-    this.store.update(token, {
+    this.store.update(instanceId, {
       status: "running",
+      trace: storedTrace,
       resumeToken: undefined,
       waitingFor: undefined,
+      pausedAtIndex: undefined,
     });
 
-    // Re-run from the beginning -- memoized nodes skip automatically
-    return this.execute(flow, record.state, token, 0, []);
+    // Continue from the node AFTER the paused one, with preserved trace
+    return this.execute(flow, record.state, instanceId, pausedAtIndex + 1, storedTrace);
   }
 
   // ---- Core execution loop ------------------------------------------------------
@@ -191,13 +221,16 @@ export class FlowRunner {
       const memo = this.store.getMemoized(instanceId, node.name);
       if (memo.found) {
         if (node.output) state[node.output] = memo.output;
-        trace.push({
-          node: node.name,
-          do: node.do,
-          status: "ok",
-          output: memo.output,
-          durationMs: 0,
-        });
+        // On resume, prior trace entries are already in priorTrace — don't re-add
+        if (!priorTrace.some((t) => t.node === node.name)) {
+          trace.push({
+            node: node.name,
+            do: node.do,
+            status: "ok",
+            output: memo.output,
+            durationMs: 0,
+          });
+        }
         i++;
         continue;
       }
@@ -205,12 +238,21 @@ export class FlowRunner {
       try {
         const result = await this.runWithRetry(node, state, flow, instanceId);
 
-        // ---- Paused for approval ------------------------------------------------
+        // ---- Paused for approval (do: wait with for: approval) ------------------
         if (result.pause) {
           const waitNode = node as WaitNode;
+          const entry: TraceEntry = {
+            node: node.name,
+            do: node.do,
+            status: "paused",
+            durationMs: Date.now() - t0,
+          };
+          trace.push(entry);
           this.store.update(instanceId, {
             status: waitNode.for === "event" ? "waiting" : "paused",
             state,
+            trace,
+            pausedAtIndex: i,
             resumeToken: instanceId,
             waitingFor: {
               type: waitNode.for,
@@ -220,12 +262,6 @@ export class FlowRunner {
                 : `Approve node "${node.name}"?`,
               timeout: waitNode.timeout,
             },
-          });
-          trace.push({
-            node: node.name,
-            do: node.do,
-            status: "paused",
-            durationMs: Date.now() - t0,
           });
           return {
             ok: true,
@@ -240,29 +276,71 @@ export class FlowRunner {
           };
         }
 
+        // ---- Paused for approve node -------------------------------------------
+        if (result.approve) {
+          const entry: TraceEntry = {
+            node: node.name,
+            do: node.do,
+            status: "paused",
+            durationMs: Date.now() - t0,
+          };
+          trace.push(entry);
+          this.store.update(instanceId, {
+            status: "paused",
+            state,
+            trace,
+            pausedAtIndex: i,
+            resumeToken: result.approve.token,
+            waitingFor: {
+              type: "approval",
+              prompt: result.approve.prompt,
+              preview: result.approve.preview,
+              timeout: result.approve.timeout,
+            },
+          });
+          return {
+            ok: true,
+            status: "paused",
+            flowName: flow.flow,
+            instanceId,
+            state,
+            trace,
+            pausedAt: node.name,
+            resumeToken: result.approve.token,
+            waitingFor: {
+              type: "approval",
+              prompt: result.approve.prompt,
+              preview: result.approve.preview,
+              timeout: result.approve.timeout,
+            },
+          };
+        }
+
         // ---- Normal completion --------------------------------------------------
         if (node.output) state[node.output] = result.output;
         this.store.memoize(instanceId, node.name, result.output);
-        this.store.update(instanceId, { state });
-        trace.push({
+        const entry: TraceEntry = {
           node: node.name,
           do: node.do,
           status: "ok",
           output: result.output,
           attempt: result.attempts,
           durationMs: Date.now() - t0,
-        });
+        };
+        trace.push(entry);
+        this.store.update(instanceId, { state, trace });
         i++;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        this.store.update(instanceId, { status: "failed", state });
-        trace.push({
+        const entry: TraceEntry = {
           node: node.name,
           do: node.do,
           status: "error",
           error: message,
           durationMs: Date.now() - t0,
-        });
+        };
+        trace.push(entry);
+        this.store.update(instanceId, { status: "failed", state, trace });
         return {
           ok: false,
           status: "failed",
@@ -275,7 +353,7 @@ export class FlowRunner {
       }
     }
 
-    this.store.update(instanceId, { status: "completed", state });
+    this.store.update(instanceId, { status: "completed", state, trace });
     return {
       ok: true,
       status: "completed",
@@ -296,6 +374,7 @@ export class FlowRunner {
   ): Promise<{
     output?: unknown;
     pause?: boolean;
+    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
     attempts?: number;
   }> {
     const policy: RetryPolicy = node.retry ?? { limit: 1, delay: 0 };
@@ -349,12 +428,18 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
-  ): Promise<{ output?: unknown; pause?: boolean }> {
+  ): Promise<{
+    output?: unknown;
+    pause?: boolean;
+    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
+  }> {
     switch (node.do) {
       case "ai":
         return this.execAi(node as AiNode, state);
       case "agent":
         return this.execAgent(node as AgentNode, state);
+      case "approve":
+        return this.execApprove(node as ApproveNode, state, flow, instanceId);
       case "branch":
         return this.execBranch(node as BranchNode, state, flow, instanceId);
       case "condition":
@@ -1130,6 +1215,53 @@ export class FlowRunner {
     return { output: fn(input, state) };
   }
 
+  // ---- do: approve --------------------------------------------------------------
+  // Human-in-the-loop gate with token-based resume.
+
+  private async execApprove(
+    node: ApproveNode,
+    state: FlowState,
+    flow: FlowDefinition,
+    instanceId: string,
+  ): Promise<{
+    approve: { token: string; prompt: string; preview?: unknown; timeout?: string };
+  }> {
+    const prompt = this.resolveTemplate(node.prompt, state);
+    const timeout = node.timeout ?? "24h";
+    const expiresAt = new Date(
+      Date.now() + parseDuration(timeout),
+    ).toISOString();
+
+    // Resolve preview data: supports dotted paths, wildcards, and template syntax
+    let preview: unknown;
+    if (node.preview) {
+      // Wrap bare paths in {{ }} so resolveBodyObject handles them
+      const previewExpr = node.preview.includes("{{")
+        ? node.preview
+        : `{{ ${node.preview} }}`;
+      preview = this.resolveBodyObject(previewExpr, state);
+    }
+
+    // Generate a short approval token
+    const token = `cf-${crypto.randomUUID().slice(0, 8)}`;
+
+    // Register in pending approvals
+    this.store.addApproval({
+      token,
+      instanceId,
+      flowName: flow.flow,
+      node: node.name,
+      prompt,
+      preview,
+      createdAt: new Date().toISOString(),
+      expiresAt,
+    });
+
+    return {
+      approve: { token, prompt, preview, timeout },
+    };
+  }
+
   // ---- do: exec ----------------------------------------------------------------
   // Runs a shell command deterministically. No AI involved.
 
@@ -1293,5 +1425,10 @@ export class FlowRunner {
 
   getStore(): StateStore {
     return this.store;
+  }
+
+  /** List all pending approvals across all flow instances */
+  listApprovals() {
+    return this.store.listApprovals();
   }
 }
