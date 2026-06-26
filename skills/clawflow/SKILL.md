@@ -1,5 +1,5 @@
 ---
-name: flow
+name: clawflow
 description: Design and run declarative agentic workflows using clawflow. Use when the user asks to create a workflow, automation, pipeline, or flow.
 ---
 

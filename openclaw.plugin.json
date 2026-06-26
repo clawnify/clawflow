@@ -2,8 +2,8 @@
   "id": "clawflow",
   "name": "ClawFlow",
   "description": "The n8n for agents. Declarative, AI-native workflow engine — LLM-writable, Cloudflare-portable.",
-  "version": "1.2.4",
-  "skills": ["./skills/flow"],
+  "version": "1.2.5",
+  "skills": ["./skills/clawflow"],
   "activation": {
     "onStartup": true
   },
