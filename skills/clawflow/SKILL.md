@@ -1,5 +1,5 @@
 ---
-name: flow
+name: clawflow
 description: Design and run declarative agentic workflows using clawflow. Use when the user asks to create a workflow, automation, pipeline, or flow.
 ---
 
@@ -129,7 +129,11 @@ Any string field supports `{{ path.to.value }}` interpolation. The top-level key
 {{ env.API_KEY }}               — environment variable (env is always available)
 {{ classification.category }}   — node with output: "classification" → access .category
 {{ inputs.user.email }}         — nested dotted path from the input payload
+{{ inputs }}                    — the WHOLE payload, auto-serialized to JSON
+{{ inputs | json }}             — same thing, explicit (preferred for clarity)
 ```
+
+A bare reference to an object or array (`{{ inputs }}`, `{{ classification }}`) renders as **JSON**, not `[object Object]` — so to drop an entire payload into a prompt or task, just write `{{ inputs | json }}`. You never need a `code` node to serialize state for a template.
 
 **Filters:** Use `{{ value | filter }}` to transform values inline:
 
@@ -159,6 +163,8 @@ Supported operators: `==`, `!=`, `>`, `<`, `>=`, `<=`. Bare paths evaluate as tr
 ```
 
 **Common mistake:** If a node has `"name": "get_data", "output": "api"`, reference it as `{{ api }}` — NOT `{{ get_data }}`. The node name is just an identifier; the output key is what goes into state.
+
+**Common mistake:** Don't add a `code` node just to `JSON.stringify` state for a template (e.g. `run: "JSON.stringify(state.inputs)"` → `{{ raw_body }}`). Templates already serialize objects automatically — use `{{ inputs | json }}` directly. A `code` node is only warranted when you need real transformation, not serialization.
 
 ### do: ai — attachments (images & PDFs)
 
