@@ -89,6 +89,87 @@ describe("Custom step types", () => {
     assert.deepEqual(received, { msg: "hello world" });
   });
 
+  // Regression: `{{ a || 'default' }}` fallback syntax must resolve to its
+  // value/default, not pass through as a literal string into node input.
+  describe("|| fallback resolution", () => {
+    async function capture(
+      fields: Record<string, unknown>,
+      input: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> {
+      const { runner, registry } = freshRunner();
+      let received: Record<string, unknown> = {};
+      registry.register({
+        name: "cap",
+        allowedKeys: Object.keys(fields),
+        run: (i) => {
+          received = i as Record<string, unknown>;
+          return null;
+        },
+      });
+      const flow: FlowDefinition = {
+        flow: "test-or-fallback",
+        nodes: [
+          {
+            name: "c",
+            do: "cap" as unknown as "code",
+            ...fields,
+            output: "out",
+          } as unknown as FlowDefinition["nodes"][number],
+        ],
+      };
+      const result = await runner.run(flow, input);
+      assert.equal(result.ok, true, result.error);
+      return received;
+    }
+
+    it("uses the value when the path is present", async () => {
+      const got = await capture(
+        { city: "{{ inputs.event.city || 'Amsterdam' }}" },
+        { event: { city: "Dublin" } },
+      );
+      assert.equal(got.city, "Dublin");
+    });
+
+    it("falls back to the default when the path is absent", async () => {
+      const got = await capture(
+        { city: "{{ inputs.event.city || 'Amsterdam' }}" },
+        { event: {} },
+      );
+      assert.equal(got.city, "Amsterdam");
+    });
+
+    it("falls back when the value is an empty string (falsy)", async () => {
+      const got = await capture(
+        { owner: "{{ inputs.event.owner || 'TBC' }}" },
+        { event: { owner: "" } },
+      );
+      assert.equal(got.owner, "TBC");
+    });
+
+    it("resolves inline within a larger string", async () => {
+      const got = await capture(
+        { title: "{{ inputs.event.title }} — hosted by {{ inputs.event.owner || 'TBC' }}" },
+        { event: { title: "Dublin Edition" } },
+      );
+      assert.equal(got.title, "Dublin Edition — hosted by TBC");
+    });
+
+    it("supports a multi-operand chain (first truthy wins)", async () => {
+      const got = await capture(
+        { city: "{{ inputs.event.city || inputs.event.region || 'Amsterdam' }}" },
+        { event: { region: "Leinster" } },
+      );
+      assert.equal(got.city, "Leinster");
+    });
+
+    it("preserves type: {{ n || 0 }} stays a number", async () => {
+      const present = await capture({ n: "{{ inputs.count || 0 }}" }, { count: 5 });
+      assert.strictEqual(present.n, 5);
+      const absent = await capture({ n: "{{ inputs.count || 0 }}" }, {});
+      assert.strictEqual(absent.n, 0);
+    });
+  });
+
   it("provides ctx.state, ctx.env, ctx.nodeName, and ctx.abortSignal", async () => {
     const { runner, registry } = freshRunner();
     let captured: { hasState: boolean; env: unknown; nodeName: string; signal: boolean } | undefined;

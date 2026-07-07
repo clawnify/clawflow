@@ -1754,6 +1754,12 @@ export class FlowRunner {
           ? arr.map((item: unknown) => this.getPath(item, wildcardMatch[2]))
           : arr;
       }
+      // Whole-string OR-chain fallback: {{ a || b || 'default' }} — type-preserving
+      // (mirrors the single-path branch above; e.g. {{ n || 0 }} stays a number).
+      const orMatch = obj.match(/^\{\{\s*([^{}?]+?\|\|[^{}?]+?)\s*\}\}$/);
+      if (orMatch) {
+        return this.resolveOrChain(orMatch[1], state);
+      }
       return this.resolveTemplate(obj, state);
     }
     if (Array.isArray(obj)) {
@@ -1788,7 +1794,19 @@ export class FlowRunner {
       },
     );
 
-    // Pass 2: wildcard  {{ path[*].field }}
+    // Pass 2: OR-chain fallback  {{ a || b || 'default' }}  (JS || semantics:
+    // first truthy operand, else the last). Runs after ternary so `?` exprs are
+    // already consumed; excludes `?`/braces so it never straddles a ternary.
+    result = result.replace(
+      /\{\{\s*([^{}?]+?\|\|[^{}?]+?)\s*\}\}/g,
+      (_m, expr: string) => {
+        const val = this.resolveOrChain(expr, state);
+        if (val === undefined || val === null) return "";
+        return typeof val === "object" ? JSON.stringify(val) : String(val);
+      },
+    );
+
+    // Pass 3: wildcard  {{ path[*].field }}
     result = result.replace(
       /\{\{\s*([\w.]+)\[\*\](?:\.([\w.]+))?\s*\}\}/g,
       (_m, arrPath: string, field?: string) => {
@@ -1799,7 +1817,7 @@ export class FlowRunner {
       },
     );
 
-    // Pass 3: simple path + optional filter  {{ path | filter }}
+    // Pass 4: simple path + optional filter  {{ path | filter }}
     result = result.replace(/\{\{\s*([\w.\[\]0-9]+)\s*(?:\|\s*(\w+))?\s*\}\}/g, (_m, p: string, filter?: string) => {
       const val = this.getPath(state, p);
       if (val === undefined) return `{{${p}}}`;
@@ -1808,6 +1826,36 @@ export class FlowRunner {
     });
 
     return result;
+  }
+
+  /**
+   * Resolve a `a || b || 'default'` chain, returning the first truthy operand's
+   * value (JS `||` semantics; all-falsy → the last operand's value). Type is
+   * preserved so `{{ n || 0 }}` yields the number 0, `{{ x || 'y' }}` a string.
+   */
+  private resolveOrChain(expr: string, state: FlowState): unknown {
+    const operands = expr.split("||");
+    let last: unknown;
+    for (const operand of operands) {
+      last = this.resolveOperand(operand, state);
+      if (last) return last;
+    }
+    return last;
+  }
+
+  /**
+   * Resolve a single template operand: a quoted string literal, a numeric /
+   * boolean / null literal, or otherwise a state path.
+   */
+  private resolveOperand(operand: string, state: FlowState): unknown {
+    const t = operand.trim();
+    const str = t.match(/^'([^']*)'$/) ?? t.match(/^"([^"]*)"$/);
+    if (str) return str[1];
+    if (t === "true") return true;
+    if (t === "false") return false;
+    if (t === "null") return null;
+    if (t !== "" && !isNaN(Number(t))) return Number(t);
+    return this.getPath(state, t);
   }
 
   /** Evaluate a simple condition expression for ternary templates */
