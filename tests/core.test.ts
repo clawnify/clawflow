@@ -2145,3 +2145,161 @@ describe("flow_edit deep node targeting", () => {
     assert.equal(updated.nodes[0].run, "'top-level-updated'");
   });
 });
+
+// ---- FlowRunner — ai node provider selection ------------------------------------
+
+describe("FlowRunner — ai node providers", () => {
+  after(cleanup);
+
+  const clawnifyProvider = {
+    baseUrl: "https://api.clawnify.example/v1",
+    api: "openai-completions" as const,
+    apiKey: "test-key",
+    models: { fast: "clawnify-lite", smart: "clawnify-pro", best: "clawnify-max" },
+  };
+
+  it("maps model tiers to a provider's model IDs (via defaultProvider)", async () => {
+    let capturedModel = "";
+    const runner = new FlowRunner({
+      ...cfg,
+      defaultProvider: "clawnify",
+      providers: { clawnify: clawnifyProvider },
+      inferenceFn: async (req) => { capturedModel = req.model; return { text: "ok" }; },
+    });
+    const flow: FlowDefinition = {
+      flow: "prov-tier",
+      nodes: [{ name: "gen", do: "ai" as const, prompt: "hi", model: "smart", output: "out" }],
+    };
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, true);
+    assert.equal(capturedModel, "clawnify-pro");
+  });
+
+  it("normalizes an unknown model to the provider's smart tier (Option A)", async () => {
+    let capturedModel = "";
+    const runner = new FlowRunner({
+      ...cfg,
+      providers: { clawnify: clawnifyProvider },
+      inferenceFn: async (req) => { capturedModel = req.model; return { text: "ok" }; },
+    });
+    const flow: FlowDefinition = {
+      flow: "prov-normalize",
+      nodes: [{
+        name: "gen", do: "ai" as const, prompt: "hi",
+        provider: "clawnify", model: "anthropic/claude-sonnet-4.6", output: "out",
+      }],
+    };
+    await runner.run(flow, {});
+    assert.equal(capturedModel, "clawnify-pro");
+  });
+
+  it("passes through a value that is already a provider model ID", async () => {
+    let capturedModel = "";
+    const runner = new FlowRunner({
+      ...cfg,
+      providers: { clawnify: clawnifyProvider },
+      inferenceFn: async (req) => { capturedModel = req.model; return { text: "ok" }; },
+    });
+    const flow: FlowDefinition = {
+      flow: "prov-passthrough",
+      nodes: [{
+        name: "gen", do: "ai" as const, prompt: "hi",
+        provider: "clawnify", model: "clawnify-max", output: "out",
+      }],
+    };
+    await runner.run(flow, {});
+    assert.equal(capturedModel, "clawnify-max");
+  });
+
+  it("routes the request to the provider baseUrl with its API key", async () => {
+    const origFetch = globalThis.fetch;
+    let seenUrl = "";
+    let seenAuth = "";
+    let seenBody: any = {};
+    globalThis.fetch = (async (url: any, init: any) => {
+      seenUrl = String(url);
+      seenAuth = init?.headers?.Authorization ?? "";
+      seenBody = JSON.parse(init?.body ?? "{}");
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "routed" } }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+    try {
+      const runner = new FlowRunner({
+        ...cfg,
+        defaultProvider: "clawnify",
+        providers: { clawnify: clawnifyProvider },
+      });
+      const flow: FlowDefinition = {
+        flow: "prov-route",
+        nodes: [{ name: "gen", do: "ai" as const, prompt: "hi", model: "fast", output: "out" }],
+      };
+      const result = await runner.run(flow, {});
+      assert.equal(result.ok, true);
+      assert.equal(result.state.out, "routed");
+      assert.equal(seenUrl, "https://api.clawnify.example/v1/chat/completions");
+      assert.equal(seenAuth, "Bearer test-key");
+      assert.equal(seenBody.model, "clawnify-lite");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("does not fall back to a stray OPENROUTER_API_KEY when a provider is selected", async () => {
+    const origFetch = globalThis.fetch;
+    const origKey = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = "sk-shared-should-not-be-used";
+    let seenUrl = "";
+    globalThis.fetch = (async (url: any) => {
+      seenUrl = String(url);
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "ok" } }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+    try {
+      const runner = new FlowRunner({
+        ...cfg,
+        defaultProvider: "clawnify",
+        providers: { clawnify: clawnifyProvider },
+      });
+      const flow: FlowDefinition = {
+        flow: "prov-no-env-leak",
+        nodes: [{ name: "gen", do: "ai" as const, prompt: "hi", output: "out" }],
+      };
+      await runner.run(flow, {});
+      assert.ok(!seenUrl.includes("openrouter.ai"), `expected clawnify route, got ${seenUrl}`);
+      assert.ok(seenUrl.startsWith("https://api.clawnify.example/v1"));
+    } finally {
+      globalThis.fetch = origFetch;
+      if (origKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = origKey;
+    }
+  });
+
+  it("fails the node when the selected provider is unknown", async () => {
+    const runner = new FlowRunner({ ...cfg });
+    const flow: FlowDefinition = {
+      flow: "prov-unknown",
+      nodes: [{ name: "gen", do: "ai" as const, prompt: "hi", provider: "nope", output: "out" }],
+    };
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, false);
+    assert.match(JSON.stringify(result), /unknown provider .*nope/);
+  });
+
+  it("fails the node when the selected provider has no API key", async () => {
+    const runner = new FlowRunner({
+      ...cfg,
+      providers: { clawnify: { baseUrl: "https://api.clawnify.example/v1", apiKeyEnv: "DEFINITELY_UNSET_KEY_XYZ" } },
+    });
+    const flow: FlowDefinition = {
+      flow: "prov-nokey",
+      nodes: [{ name: "gen", do: "ai" as const, prompt: "hi", provider: "clawnify", output: "out" }],
+    };
+    const result = await runner.run(flow, {});
+    assert.equal(result.ok, false);
+    assert.match(JSON.stringify(result), /no API key/);
+  });
+});
