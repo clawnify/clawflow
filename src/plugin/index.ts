@@ -1330,8 +1330,15 @@ Examples:
   Add inside branch:  { action: "add", parent: "shouldUpdate/true", nodeDefinition: { name: "step3", do: "code", run: "..." } }
   Remove:             { action: "remove", node: "old-step" }
   Move into loop:     { action: "move", node: "step3", parent: "myLoop", position: 0 }
+  Move into else:     { action: "move", node: "step3", parent: "myCond/else", position: 0 }
   Wrap in loop:       { action: "wrap", nodes: ["step1", "step2"], wrapper: { name: "myLoop", do: "loop", over: "items", as: "item" } }
-  List:               { action: "list" }`,
+  Wrap in condition:  { action: "wrap", nodes: ["step1", "step2"], wrapper: { name: "guard", do: "condition", if: "{{ items.length > 0 }}" } }
+  List:               { action: "list" }
+
+To RESTRUCTURE an existing flow — make a group of nodes conditional, nest them in a
+loop, or reparent them — use "wrap" (many nodes at once) or "move" (one node into a
+"parent" path like "guard/else"). Do NOT remove-and-re-add each node, and do NOT
+re-send the whole flow: a single large edit is slow and can stall mid-generation.`,
 
       parameters: {
         type: "object",
