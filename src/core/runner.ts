@@ -11,7 +11,6 @@ import {
   PluginConfig,
   MODEL_MAP,
   OPENROUTER_MODEL_MAP,
-  DEFAULT_MODEL,
   RetryPolicy,
   AiNode,
   AgentNode,
@@ -26,6 +25,7 @@ import {
   CodeNode,
   ExecNode,
   ContentPart,
+  ProviderSpec,
   parseDuration,
 } from "./types.js";
 import { StateStore } from "./store.js";
@@ -36,6 +36,23 @@ import {
   type CustomStepDefinition,
   type StepRegistry,
 } from "./custom-steps.js";
+
+// ---- Built-in AI providers ------------------------------------------------------
+// Selectable by name from an `ai` node's `provider` field (or cfg.defaultProvider).
+// Each reads its key from an env var; override any of them via cfg.providers.
+
+const BUILTIN_PROVIDERS: Record<string, ProviderSpec> = {
+  openrouter: { baseUrl: "https://openrouter.ai/api", api: "openai-completions", apiKeyEnv: "OPENROUTER_API_KEY" },
+  anthropic: { baseUrl: "https://api.anthropic.com", api: "anthropic-messages", apiKeyEnv: "ANTHROPIC_API_KEY" },
+  openai: { baseUrl: "https://api.openai.com", api: "openai-completions", apiKeyEnv: "OPENAI_API_KEY" },
+};
+
+/** A provider spec with its API key resolved, ready to call. */
+interface ResolvedProvider {
+  name: string;
+  spec: ProviderSpec;
+  apiKey: string;
+}
 
 // ---- Event Bus ------------------------------------------------------------------
 // External systems call sendEvent(instanceId, type, payload) to unblock
@@ -545,11 +562,8 @@ export class FlowRunner {
     node: AiNode,
     state: FlowState,
   ): Promise<{ output: unknown }> {
-    const model =
-      MODEL_MAP[node.model ?? "smart"] ??
-      node.model ??
-      this.cfg.defaultModel ??
-      DEFAULT_MODEL;
+    const provider = this.resolveProvider(node.provider);
+    const model = this.resolveModel(node.model, provider);
 
     const input = node.input ? this.getPath(state, node.input) : undefined;
     const prompt = this.resolveTemplate(node.prompt, state);
@@ -575,7 +589,7 @@ export class FlowRunner {
       }
     }
 
-    const text = await this.callInference(model, system, userText, node.temperature, node.maxTokens, contentParts);
+    const text = await this.callInference(model, system, userText, node.temperature, node.maxTokens, contentParts, provider);
 
     if (node.schema) {
       const clean = text
@@ -607,6 +621,15 @@ export class FlowRunner {
 
   private static isUrl(s: string): boolean {
     return /^https?:\/\//i.test(s);
+  }
+
+  /**
+   * Normalize a provider baseUrl before appending an endpoint. Accepts URLs both
+   * with and without a trailing "/v1" (OpenClaw-style provider configs include it),
+   * so we always hit ".../v1/<endpoint>" exactly once instead of "/v1/v1/...".
+   */
+  private static apiBase(baseUrl: string): string {
+    return baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
   }
 
   private attachmentToContentPart(value: string): ContentPart {
@@ -686,8 +709,59 @@ export class FlowRunner {
   }
 
 
+  // ---- Provider resolution ------------------------------------------------------
+  // An `ai` node runs against a named provider when one is selected (node.provider
+  // or cfg.defaultProvider), otherwise it falls back to legacy env auto-detection.
+  // Selecting a provider is how a host routes flow AI spend through its own
+  // per-caller credential path instead of a shared process-env key.
+
+  private resolveProvider(name?: string): ResolvedProvider | null {
+    const providerName = name ?? this.cfg.defaultProvider;
+    if (!providerName) return null; // legacy env auto-detect
+
+    const spec = this.cfg.providers?.[providerName] ?? BUILTIN_PROVIDERS[providerName];
+    if (!spec) {
+      throw new Error(
+        `ai node references unknown provider "${providerName}". ` +
+          `Configure it under plugins.clawflow.config.providers, or use a built-in: ` +
+          `${Object.keys(BUILTIN_PROVIDERS).join(", ")}.`,
+      );
+    }
+
+    const apiKey = spec.apiKey ?? (spec.apiKeyEnv ? process.env[spec.apiKeyEnv] : undefined);
+    if (!apiKey) {
+      throw new Error(
+        `ai node provider "${providerName}" has no API key ` +
+          `(looked in ${spec.apiKeyEnv ? `env ${spec.apiKeyEnv}` : "config apiKey"}).`,
+      );
+    }
+    return { name: providerName, spec, apiKey };
+  }
+
+  /**
+   * Resolve an `ai` node's `model` to a concrete model ID. With a provider that
+   * declares a tier map, "fast"/"smart"/"best" map to its model IDs and any other
+   * value is normalized to the "smart" tier (Option A). Without one, falls back to
+   * the generic tier shorthand and otherwise passes the value through.
+   */
+  private resolveModel(rawModel: string | undefined, provider: ResolvedProvider | null): string {
+    const tier = rawModel ?? this.cfg.defaultModel ?? "smart";
+    const models = provider?.spec.models;
+    if (models) {
+      if (models[tier]) return models[tier];
+      if (Object.values(models).includes(tier)) return tier; // already a provider model id
+      const fallback = models["smart"] ?? Object.values(models)[0];
+      if (fallback) {
+        console.warn(
+          `[clawflow] ai model "${tier}" is not valid for provider "${provider!.name}"; using "${fallback}"`,
+        );
+        return fallback;
+      }
+    }
+    return MODEL_MAP[tier] ?? tier;
+  }
+
   // ---- Inference dispatch -------------------------------------------------------
-  // Direct API call: OpenRouter > Anthropic > OpenAI
 
   private async callInference(
     model: string,
@@ -696,6 +770,7 @@ export class FlowRunner {
     temperature?: number,
     maxTokens?: number,
     content?: ContentPart[],
+    provider?: ResolvedProvider | null,
   ): Promise<string> {
     // Optional override (used by tests and embedders)
     if (this.cfg.inferenceFn) {
@@ -709,7 +784,7 @@ export class FlowRunner {
       });
       return result.text;
     }
-    return this.callDirectApi(model, system, prompt, temperature, maxTokens, content);
+    return this.callDirectApi(model, system, prompt, temperature, maxTokens, content, provider);
   }
 
   private async callDirectApi(
@@ -719,8 +794,36 @@ export class FlowRunner {
     temperature?: number,
     maxTokens?: number,
     content?: ContentPart[],
+    provider?: ResolvedProvider | null,
   ): Promise<string> {
-    // Try OpenRouter first, then Anthropic, then OpenAI
+    // A selected provider is the single credential/routing path — no env racing.
+    if (provider) {
+      if ((provider.spec.api ?? "openai-completions") === "anthropic-messages") {
+        return this.callAnthropicMessages(
+          provider.spec.baseUrl,
+          provider.apiKey,
+          model,
+          system,
+          prompt,
+          temperature,
+          maxTokens,
+          content,
+        );
+      }
+      return this.callOpenAiCompatible(
+        provider.spec.baseUrl,
+        provider.apiKey,
+        model,
+        system,
+        prompt,
+        temperature,
+        provider.name,
+        maxTokens,
+        content,
+      );
+    }
+
+    // Legacy env auto-detect: OpenRouter > Anthropic > OpenAI.
     const openrouterKey = process.env.OPENROUTER_API_KEY;
     const anthropicKey = this.cfg.apiKey ?? process.env.ANTHROPIC_API_KEY;
     const openaiKey = process.env.OPENAI_API_KEY;
@@ -743,34 +846,16 @@ export class FlowRunner {
     }
 
     if (anthropicKey) {
-      const baseUrl = this.cfg.baseUrl ?? "https://api.anthropic.com";
-
-      // Convert content parts to Anthropic format when multimodal
-      const userContent = content
-        ? this.toAnthropicContent(content)
-        : prompt;
-
-      const resp = await fetch(`${baseUrl}/v1/messages`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": anthropicKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: maxTokens ?? 4096,
-          temperature: temperature ?? 0,
-          system,
-          messages: [{ role: "user", content: userContent }],
-        }),
-      });
-      if (!resp.ok)
-        throw new Error(`Anthropic API ${resp.status}: ${await resp.text()}`);
-      const data = (await resp.json()) as {
-        content: Array<{ type: string; text: string }>;
-      };
-      return data.content.find((b) => b.type === "text")?.text ?? "";
+      return this.callAnthropicMessages(
+        this.cfg.baseUrl ?? "https://api.anthropic.com",
+        anthropicKey,
+        model,
+        system,
+        prompt,
+        temperature,
+        maxTokens,
+        content,
+      );
     }
 
     if (openaiKey) {
@@ -789,10 +874,47 @@ export class FlowRunner {
 
     throw new Error(
       "No AI backend available. Set one of:\n" +
+        "  - a provider via plugins.clawflow.config (defaultProvider/providers)\n" +
         "  - OPENROUTER_API_KEY env var\n" +
         "  - ANTHROPIC_API_KEY env var (or apiKey in plugin config)\n" +
         "  - OPENAI_API_KEY env var",
     );
+  }
+
+  private async callAnthropicMessages(
+    baseUrl: string,
+    apiKey: string,
+    model: string,
+    system: string,
+    prompt: string,
+    temperature?: number,
+    maxTokens?: number,
+    content?: ContentPart[],
+  ): Promise<string> {
+    // Convert content parts to Anthropic format when multimodal
+    const userContent = content ? this.toAnthropicContent(content) : prompt;
+
+    const resp = await fetch(`${FlowRunner.apiBase(baseUrl)}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens ?? 4096,
+        temperature: temperature ?? 0,
+        system,
+        messages: [{ role: "user", content: userContent }],
+      }),
+    });
+    if (!resp.ok)
+      throw new Error(`Anthropic API ${resp.status}: ${await resp.text()}`);
+    const data = (await resp.json()) as {
+      content: Array<{ type: string; text: string }>;
+    };
+    return data.content.find((b) => b.type === "text")?.text ?? "";
   }
 
   private async callOpenAiCompatible(
@@ -810,11 +932,11 @@ export class FlowRunner {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     };
-    if (provider === "OpenRouter") {
+    if (provider.toLowerCase() === "openrouter") {
       headers["HTTP-Referer"] = "https://clawnify.com";
       headers["X-OpenRouter-Title"] = "Clawnify";
     }
-    const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+    const resp = await fetch(`${FlowRunner.apiBase(baseUrl)}/v1/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify({

@@ -85,12 +85,18 @@ export interface AiNode extends BaseNode {
   input?: string; // dotted path into flow state
   schema?: Record<string, string>; // output shape; enables JSON mode
   model?: "fast" | "smart" | "best" | string;
+  /**
+   * Named backend to run this node against — a key in `PluginConfig.providers`
+   * or a built-in (`"openrouter"`, `"anthropic"`, `"openai"`). Falls back to
+   * `PluginConfig.defaultProvider`, then to legacy env-var auto-detection.
+   */
+  provider?: string;
   temperature?: number;
   maxTokens?: number;
   /** File paths (images, PDFs) to include as multimodal content. Supports templates. */
   attachments?: string[];
 }
-const AI_KEYS = ["prompt", "input", "schema", "model", "temperature", "maxTokens", "attachments"] as const;
+const AI_KEYS = ["prompt", "input", "schema", "model", "provider", "temperature", "maxTokens", "attachments"] as const;
 const _aiCheck: CheckKeys<AiNode, typeof AI_KEYS> = true;
 
 export interface AgentNode extends BaseNode {
@@ -366,6 +372,29 @@ export interface InferenceResult {
 
 export type InferenceFn = (req: InferenceRequest) => Promise<InferenceResult>;
 
+// ---- Providers ------------------------------------------------------------------
+// A named AI backend an `ai` node can target. When the host resolves per-caller
+// credentials (e.g. an org's BYOK key behind a gateway), point a provider at that
+// endpoint so flow AI spend follows the same credential/routing path as the rest
+// of the platform instead of a shared process-env key.
+
+export interface ProviderSpec {
+  /** Base URL of the provider, e.g. "https://api.clawnify.com/v1". */
+  baseUrl: string;
+  /** Wire format. Default "openai-completions". */
+  api?: "openai-completions" | "anthropic-messages";
+  /** Literal API key. Prefer `apiKeyEnv` so secrets stay out of the config file. */
+  apiKey?: string;
+  /** Name of an env var holding the API key, resolved at call time. */
+  apiKeyEnv?: string;
+  /**
+   * Maps flow model tiers ("fast" | "smart" | "best") to this provider's model
+   * IDs. An `ai` node's `model` that isn't a tier and isn't one of these IDs is
+   * normalized to the "smart" tier.
+   */
+  models?: Record<string, string>;
+}
+
 // ---- Plugin Config --------------------------------------------------------------
 
 export interface ServeConfig {
@@ -378,6 +407,18 @@ export interface PluginConfig {
   apiKey?: string;
   defaultModel?: string;
   baseUrl?: string;
+  /**
+   * Named AI backends selectable per `ai` node via its `provider` field. The
+   * keys `"openrouter"`, `"anthropic"`, and `"openai"` are built in (env-keyed)
+   * and can be overridden here.
+   */
+  providers?: Record<string, ProviderSpec>;
+  /**
+   * Provider used by `ai` nodes that don't set their own `provider`. When set,
+   * it takes precedence over legacy env-var auto-detection, so a stray
+   * `OPENROUTER_API_KEY` in the environment can't silently win.
+   */
+  defaultProvider?: string;
   memoryDir?: string;
   maxNodeDurationMs?: number;
   stateDir?: string; // where to persist flow state across restarts

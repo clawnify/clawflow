@@ -181,9 +181,28 @@ The most important node. A single LLM call that returns structured or freeform o
 | `input` | Dotted path to a value in flow state passed as context |
 | `schema` | Output shape. When set, enforces JSON mode. Keys are type hints. |
 | `model` | `fast` (Gemini 3 Flash), `smart` (Claude Sonnet 4.6), `best` (Minimax M2.5), or any model string |
+| `provider` | Named backend to run against — a key in `providers` config or a built-in (`openrouter`, `anthropic`, `openai`). Defaults to `defaultProvider`, then env auto-detect. |
 | `temperature` | 0–1, default 0 for deterministic workflow steps |
 
 **Why schema matters:** downstream nodes reference `classification.category` as a reliable string. Without schema, the output is freeform text and you're back to parsing.
+
+**Choosing a provider.** By default an `ai` node auto-detects a backend from the environment (`OPENROUTER_API_KEY` → `ANTHROPIC_API_KEY` → `OPENAI_API_KEY`). To run flow AI through a specific backend — for per-caller credentials, quota, or attribution instead of a shared process-env key — configure named providers on the plugin and point nodes at them:
+
+```json
+{
+  "defaultProvider": "clawnify",
+  "providers": {
+    "clawnify": {
+      "baseUrl": "https://api.clawnify.com/v1",
+      "api": "openai-completions",
+      "apiKeyEnv": "OPENCLAW_GATEWAY_TOKEN",
+      "models": { "fast": "clawnify-lite", "smart": "clawnify-pro", "best": "clawnify-max" }
+    }
+  }
+}
+```
+
+With `defaultProvider` set, every `ai` node routes through that provider (a stray `OPENROUTER_API_KEY` in the environment can no longer win), and a node's `model` tier maps to the provider's own model IDs. Any per-node `provider` overrides the default.
 
 ---
 
