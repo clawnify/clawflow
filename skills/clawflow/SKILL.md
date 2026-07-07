@@ -576,6 +576,33 @@ flows/
 
 **Always use `flow_read` before running an unfamiliar flow** to understand what inputs it expects.
 
+## Editing existing flows
+
+`flow_edit` makes **surgical, in-place edits** to the draft — one operation at a time. Prefer it to rewriting the file. Actions:
+
+- `add` — insert a node at a position (or inside a branch via `parent`)
+- `remove` — remove a node by name
+- `move` — reparent or reorder a single node (`node` + `parent` + `position`)
+- `wrap` — wrap one or more existing nodes into a new container (`loop`, `condition`, `branch`, `parallel`)
+- `update` — change fields on a node, or replace it whole
+- `revert` — undo the last edit (restores the previous auto-snapshot)
+
+All node-targeting actions search recursively through nested structures, and `parent` takes a slash-separated path into them: `"myCond/then"`, `"myCond/else"`, `"myLoop"`, `"outer/true/inner"`.
+
+**To restructure — nest existing nodes under a condition or loop, reorder them, or make a group conditional — use `wrap` or `move`. Do NOT remove-and-re-add every node, and do NOT re-emit the entire flow definition as one giant edit.** Whole-flow rewrites are slow, easy to get wrong, and — because a large single response can stall mid-generation — may fail partway and leave you re-typing everything.
+
+Example — make the whole pipeline run only when a guard passes, in one call (instead of rewriting the flow):
+
+```
+flow_edit file: "notify-event-created" action: "wrap"
+  nodes: ["extract_venue", "lookup_venue", "match_or_create_venue", "is_new_venue"]
+  wrapper: { name: "if_not_duplicate", do: "condition", if: "{{ existing_events.body.events.length === 0 }}" }
+```
+
+To move already-existing nodes into an existing condition's `else` branch instead, `move` each one with `parent: "if_not_duplicate/else"`.
+
+Every edit is validated after it applies; if validation fails the edit is rejected and the draft is unchanged. Each edit also snapshots to the undo stack, so `revert` walks you back.
+
 ## Other tools
 
 | Tool | Use |
