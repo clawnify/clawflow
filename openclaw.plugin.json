@@ -2,7 +2,7 @@
   "id": "clawflow",
   "name": "ClawFlow",
   "description": "The n8n for agents. Declarative, AI-native workflow engine — LLM-writable, Cloudflare-portable.",
-  "version": "1.2.7",
+  "version": "1.2.8",
   "skills": ["./skills/clawflow"],
   "activation": {
     "onStartup": true
@@ -33,6 +33,22 @@
       "memoryDir": { "type": "string" },
       "stateDir": { "type": "string" },
       "maxNodeDurationMs": { "type": "number" },
+      "defaultProvider": { "type": "string" },
+      "providers": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "baseUrl": { "type": "string" },
+            "api": { "type": "string", "enum": ["openai-completions", "anthropic-messages"] },
+            "apiKey": { "type": "string" },
+            "apiKeyEnv": { "type": "string" },
+            "models": { "type": "object", "additionalProperties": { "type": "string" } }
+          },
+          "required": ["baseUrl"]
+        }
+      },
       "serve": {
         "type": "object",
         "properties": {
