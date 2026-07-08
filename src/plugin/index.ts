@@ -535,7 +535,10 @@ State model:
 
 Node types:
   ai       — LLM call, structured or freeform. Use schema: for typed output.
-  agent    — open-ended autonomous task (falls back to high-capability AI)
+  agent    — delegate to a real OpenClaw agent. Target with agentId (a configured
+             agent slug, e.g. "clawflow") and/or session (a session key, e.g.
+             "agent:main:slack:channel:agent" → --session-key). A bare session key
+             is scoped by agentId; an "agent:"-prefixed key is self-scoping.
   branch   — route to different nodes based on a value: { on, paths, default }
   loop     — iterate over a list: { over, as, nodes[] }
   parallel — run nodes concurrently: { nodes[], mode: "all"|"race" }
