@@ -1,5 +1,6 @@
 import {
   NODE_KEYS,
+  NODE_FIELD_MODES,
   type FlowDefinition,
   type FlowNode,
   type AiNode,
@@ -29,6 +30,8 @@ export interface ValidationError {
 export interface ValidationResult {
   ok: boolean;
   errors: ValidationError[];
+  /** Non-blocking notices (e.g. deprecated field names). Do not fail the flow. */
+  warnings: ValidationError[];
 }
 
 export interface ValidateFlowOptions {
@@ -47,9 +50,11 @@ export function validateFlow(
     errors.push({ message: 'Missing or invalid "flow" name' });
   }
 
+  const warnings: ValidationError[] = [];
+
   if (!Array.isArray(flow.nodes) || flow.nodes.length === 0) {
     errors.push({ message: "Flow must have at least one node" });
-    return { ok: false, errors };
+    return { ok: false, errors, warnings };
   }
 
   // Validate env field if present
@@ -74,7 +79,36 @@ export function validateFlow(
   // Walk all nodes and validate
   validateNodes(flow.nodes, new Set<string>(), errors, registry);
 
-  return { ok: errors.length === 0, errors };
+  // Non-blocking deprecation notices (renamed fields still work as aliases)
+  collectDeprecations(flow.nodes, warnings);
+
+  return { ok: errors.length === 0, errors, warnings };
+}
+
+// Agent-node fields renamed in v1.3.1 to mirror the openclaw CLI flags. The old
+// names still work (resolved as aliases in the runner); surface a nudge to migrate.
+const DEPRECATED_AGENT_FIELDS: Record<string, string> = {
+  agentId: "agent",
+  session: "sessionKey",
+};
+
+/** Walk the node tree and warn on deprecated field usage. */
+function collectDeprecations(nodes: FlowNode[], warnings: ValidationError[]): void {
+  for (const node of nodes) {
+    if (node.do === "agent") {
+      const raw = node as unknown as Record<string, unknown>;
+      for (const [oldName, newName] of Object.entries(DEPRECATED_AGENT_FIELDS)) {
+        if (raw[oldName] !== undefined) {
+          warnings.push({
+            node: node.name,
+            field: oldName,
+            message: `agent node "${node.name}": "${oldName}" is deprecated — use "${newName}" instead (aligns with the openclaw CLI flag). "${oldName}" still works for now.`,
+          });
+        }
+      }
+    }
+    for (const child of getChildNodes(node)) collectDeprecations(child, warnings);
+  }
 }
 
 // ---- Helpers --------------------------------------------------------------------
@@ -212,8 +246,10 @@ function validateNodeFields(
       const n = node as AgentNode;
       if (!n.task) e("task", `agent node "${node.name}" requires "task"`);
       if ("model" in node) e("model", `agent node "${node.name}" does not support "model" — configure the model on the openclaw agent instead`);
-      if (typeof n.agentId === "string" && n.agentId.includes(":"))
-        e("agentId", `agent node "${node.name}" has a session-key-shaped "agentId" ("${n.agentId}") — "agentId" is a plain agent slug (e.g. "main"). Use "session" for a session key like "agent:main:slack:channel:agent".`);
+      const agentField = n.agent !== undefined ? "agent" : "agentId";
+      const agentVal = n.agent ?? n.agentId;
+      if (typeof agentVal === "string" && agentVal.includes(":"))
+        e(agentField, `agent node "${node.name}" has a session-key-shaped "${agentField}" ("${agentVal}") — "${agentField}" is a plain agent slug (e.g. "main"). Use "sessionKey" for a session key like "agent:main:slack:channel:agent".`);
       break;
     }
     case "branch": {
@@ -490,50 +526,47 @@ function validateSubFlows(
   }
 }
 
-/** Collect all string-valued fields from a node (for template checking) */
+/**
+ * Collect all template-bearing string fields from a node (for {{ }} ref checking).
+ *
+ * Which fields carry templates comes from NODE_FIELD_MODES — the same registry the
+ * runner interpolates against — so the validator can never disagree with runtime
+ * about whether a field is dynamic (e.g. agent `agentId`/`session`). Modes template,
+ * templateEach, and templateDeep are scanned; path/expr are checked separately by
+ * checkStateRefs; children/code/literal carry no templates.
+ */
 function collectStringFields(
   node: FlowNode,
   registry: StepRegistry,
 ): { field: string; value: string }[] {
   const result: { field: string; value: string }[] = [];
-  // Fields that contain template-interpolated strings on built-in nodes.
-  const builtInTemplateFields = ["prompt", "task", "url", "key", "value", "run", "body", "if", "command", "cwd", "preview"];
-  // For custom-step nodes, every declared field is treated as potentially template-bearing.
-  const customStep = typeof node.do === "string" ? registry.get(node.do) : undefined;
-  const templateFields = customStep
-    ? Array.from(new Set([...builtInTemplateFields, ...customStep.allowedKeys]))
-    : builtInTemplateFields;
+  const raw = node as unknown as Record<string, unknown>;
 
-  for (const field of templateFields) {
-    const val = (node as unknown as Record<string, unknown>)[field];
+  const scan = (field: string, val: unknown) => {
     if (typeof val === "string") {
       result.push({ field, value: val });
+    } else if (Array.isArray(val)) {
+      val.forEach((v, i) => {
+        if (typeof v === "string") result.push({ field: `${field}[${i}]`, value: v });
+      });
     } else if (val !== null && typeof val === "object") {
-      // body can be an object with string values
       collectObjectStrings(val as Record<string, unknown>, field, result);
     }
-  }
+  };
 
-  // Check attachments (array of template strings)
-  const attachments = (node as unknown as Record<string, unknown>).attachments;
-  if (Array.isArray(attachments)) {
-    for (let i = 0; i < attachments.length; i++) {
-      if (typeof attachments[i] === "string") {
-        result.push({ field: `attachments[${i}]`, value: attachments[i] as string });
+  const modes = typeof node.do === "string" ? NODE_FIELD_MODES[node.do] : undefined;
+  if (modes) {
+    for (const [field, mode] of Object.entries(modes)) {
+      if (mode === "template" || mode === "templateEach" || mode === "templateDeep") {
+        scan(field, raw[field]);
       }
     }
-  }
-
-  // Check headers
-  const headers = (node as unknown as Record<string, unknown>).headers;
-  if (headers && typeof headers === "object") {
-    collectObjectStrings(headers as Record<string, unknown>, "headers", result);
-  }
-
-  // Check wait prompt
-  if (node.do === "wait") {
-    const n = node as WaitNode;
-    if (n.prompt) result.push({ field: "prompt", value: n.prompt });
+  } else {
+    // Custom-step node: every declared field is treated as potentially template-bearing.
+    const customStep = typeof node.do === "string" ? registry.get(node.do) : undefined;
+    if (customStep) {
+      for (const field of customStep.allowedKeys) scan(field, raw[field]);
+    }
   }
 
   return result;

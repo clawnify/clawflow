@@ -236,6 +236,59 @@ describe("FlowRunner — code node diagnostics", () => {
 
 // ---- FlowRunner: exec node ------------------------------------------------------
 
+describe("FlowRunner — agent node field resolution", () => {
+  after(cleanup);
+
+  // agent nodes shell out to the openclaw CLI, so we can't drive them end-to-end
+  // here. This asserts the generic pre-resolution pass (execNode → resolveNodeFields)
+  // interpolates the CLI-selector fields, which is the whole point of classifying
+  // agent/sessionKey/sessionId/channel as "template" in NODE_FIELD_MODES.
+  it("interpolates agent/sessionKey/sessionId/channel templates; leaves the node unmutated", () => {
+    const runner = new FlowRunner(cfg) as any;
+    const node = {
+      name: "reply",
+      do: "agent",
+      task: "answer {{ inputs.q }}",
+      agent: "{{ route.slug }}",
+      sessionKey: "agent:{{ route.slug }}:slack:{{ inputs.channel }}",
+      sessionId: "{{ route.sid }}",
+      channel: "{{ route.channel }}",
+    };
+    const state = {
+      route: { slug: "ops", sid: "sess-9", channel: "slack" },
+      inputs: { q: "hi", channel: "c123" },
+    };
+    const resolved = runner.resolveNodeFields(node, state);
+
+    assert.equal(resolved.agent, "ops");
+    assert.equal(resolved.sessionKey, "agent:ops:slack:c123");
+    assert.equal(resolved.sessionId, "sess-9");
+    assert.equal(resolved.channel, "slack");
+    assert.equal(resolved.task, "answer hi");
+    // original node is not mutated (flows are reused across runs)
+    assert.equal(node.agent, "{{ route.slug }}");
+    assert.equal(node.sessionId, "{{ route.sid }}");
+  });
+
+  it("builds openclaw agent selector args from target fields", () => {
+    const runner = new FlowRunner(cfg) as any;
+    // all selectors pass through in order; --channel is delivery, not a target
+    assert.deepEqual(
+      runner.buildAgentArgs({ agent: "ops", sessionKey: "s-key", sessionId: "s-id", channel: "slack" }),
+      ["--agent", "ops", "--session-key", "s-key", "--session-id", "s-id", "--channel", "slack"],
+    );
+    // sessionKey only, no agent → key alone (openclaw scopes it)
+    assert.deepEqual(runner.buildAgentArgs({ sessionKey: "agent:main:slack:c1" }), [
+      "--session-key", "agent:main:slack:c1",
+    ]);
+    // no target selector at all → fall back to a routable default agent
+    assert.deepEqual(runner.buildAgentArgs({}), ["--agent", "main"]);
+    assert.deepEqual(runner.buildAgentArgs({ channel: "slack" }), ["--channel", "slack", "--agent", "main"]);
+    // a bare sessionId is a target → no default-agent fallback
+    assert.deepEqual(runner.buildAgentArgs({ sessionId: "sess-9" }), ["--session-id", "sess-9"]);
+  });
+});
+
 describe("FlowRunner — exec node", () => {
   after(cleanup);
 
@@ -1290,6 +1343,96 @@ describe("validateFlow", () => {
     };
     const result = validateFlow(flow);
     assert.equal(result.ok, true, JSON.stringify(result.errors));
+  });
+
+  it("validates template refs in agentId/session (dynamic fields)", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-dynamic-target",
+      nodes: [
+        { name: "route", do: "code" as const, run: "({ slug: 'ops' })", output: "route" },
+        {
+          name: "reply",
+          do: "agent" as const,
+          task: "answer",
+          agentId: "{{ route.slug }}",
+          session: "{{ route.slug }}-42",
+          output: "r",
+        },
+      ] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, true, JSON.stringify(result.errors));
+  });
+
+  it("accepts an agent node with channel and sessionId selectors", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-selectors",
+      nodes: [{
+        name: "reply",
+        do: "agent" as const,
+        task: "answer",
+        agentId: "ops",
+        sessionId: "sess-9",
+        channel: "slack",
+        output: "r",
+      }] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, true, JSON.stringify(result.errors));
+  });
+
+  it("flags an undefined template ref in agentId", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-bad-ref",
+      nodes: [{
+        name: "reply",
+        do: "agent" as const,
+        task: "answer",
+        agentId: "{{ nope.slug }}",
+        output: "r",
+      }] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, false);
+    assert.ok(
+      result.errors.some((e) => e.field === "agentId" && e.message.includes("nope")),
+      JSON.stringify(result.errors),
+    );
+  });
+
+  it("accepts the new agent/sessionKey names with no deprecation warnings", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-new-names",
+      nodes: [{
+        name: "reply",
+        do: "agent" as const,
+        task: "answer",
+        agent: "ops",
+        sessionKey: "incident-42",
+        output: "r",
+      }] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, true, JSON.stringify(result.errors));
+    assert.equal(result.warnings.length, 0, JSON.stringify(result.warnings));
+  });
+
+  it("warns (non-blocking) on deprecated agentId/session aliases", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-deprecated",
+      nodes: [{
+        name: "reply",
+        do: "agent" as const,
+        task: "answer",
+        agentId: "ops",
+        session: "incident-42",
+        output: "r",
+      }] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, true, JSON.stringify(result.errors)); // aliases still work
+    assert.ok(result.warnings.some((w) => w.field === "agentId" && /deprecated/.test(w.message)));
+    assert.ok(result.warnings.some((w) => w.field === "session" && /deprecated/.test(w.message)));
   });
 });
 

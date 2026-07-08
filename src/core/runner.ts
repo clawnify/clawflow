@@ -26,6 +26,7 @@ import {
   ExecNode,
   ContentPart,
   ProviderSpec,
+  NODE_FIELD_MODES,
   parseDuration,
 } from "./types.js";
 import { StateStore } from "./store.js";
@@ -131,6 +132,9 @@ export class FlowRunner {
   ): Promise<FlowResult> {
     // Static validation before execution
     const validation = validateFlow(flow, { registry: this.registry });
+    for (const w of validation.warnings) {
+      console.warn(`[clawflow] ${w.node ? `[${w.node}] ` : ""}${w.message}`);
+    }
     if (!validation.ok) {
       const id = instanceId ?? crypto.randomUUID();
       const messages = validation.errors.map((e) =>
@@ -506,6 +510,12 @@ export class FlowRunner {
     output?: unknown;
     approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
   }> {
+    // Interpolate every field classified as a template value in NODE_FIELD_MODES,
+    // once, before dispatch — so handlers never re-decide "is this field dynamic?".
+    // Structural fields (paths, expressions, child blocks, deep bodies) are left
+    // untouched here and resolved by their handler where timing matters.
+    node = this.resolveNodeFields(node, state);
+
     switch (node.do) {
       case "ai":
         return this.execAi(node as AiNode, state);
@@ -566,7 +576,7 @@ export class FlowRunner {
     const model = this.resolveModel(node.model, provider);
 
     const input = node.input ? this.getPath(state, node.input) : undefined;
-    const prompt = this.resolveTemplate(node.prompt, state);
+    const prompt = node.prompt; // template already interpolated by resolveNodeFields
 
     const jsonInstructions = node.schema
       ? `\n\nReturn ONLY valid JSON matching exactly this schema (no markdown, no commentary):\n${JSON.stringify(node.schema, null, 2)}`
@@ -583,8 +593,8 @@ export class FlowRunner {
     let contentParts: ContentPart[] | undefined;
     if (node.attachments?.length) {
       contentParts = [{ type: "text", text: userText }];
-      for (const raw of node.attachments) {
-        const resolved = this.resolveTemplate(raw, state);
+      for (const resolved of node.attachments) {
+        // paths already interpolated by resolveNodeFields (templateEach)
         contentParts.push(this.attachmentToContentPart(resolved));
       }
     }
@@ -965,7 +975,7 @@ export class FlowRunner {
     node: AgentNode,
     state: FlowState,
   ): Promise<{ output: unknown }> {
-    const task = this.resolveTemplate(node.task, state);
+    const task = node.task; // template already interpolated by resolveNodeFields
     const input = node.input ? this.getPath(state, node.input) : undefined;
     const fullPrompt =
       input != null
@@ -976,14 +986,51 @@ export class FlowRunner {
       ? parseDuration(node.timeout)
       : undefined;
 
-    const cliResult = await this.tryOpenClawAgent(fullPrompt, node.agentId, node.session, state, timeoutMs);
+    const cliResult = await this.tryOpenClawAgent(
+      fullPrompt,
+      {
+        // new names win; agentId/session are accepted as deprecated aliases
+        agent: node.agent ?? node.agentId,
+        sessionKey: node.sessionKey ?? node.session,
+        sessionId: node.sessionId,
+        channel: node.channel,
+      },
+      state,
+      timeoutMs,
+    );
     return { output: this.autoParseJson(cliResult) };
+  }
+
+  // Build the `openclaw agent` selector args from a node's target fields. Mirrors
+  // OpenClaw's own selectors, which compose:
+  //   --agent <id>         scopes to a configured agent
+  //   --session-key <key>  an exact session key (agent:<id>:<key>, or scoped to --agent)
+  //   --session-id <id>    the most specific: one explicit session (scoped by --agent)
+  //   --channel <channel>  delivery channel for the reply
+  // We pass through whichever are set and let OpenClaw resolve/enforce consistency
+  // rather than re-asserting it here. When no target selector is set at all, fall
+  // back to a configured agent (defaultAgent > "main") so the call is routable.
+  private buildAgentArgs(target: {
+    agent?: string;
+    sessionKey?: string;
+    sessionId?: string;
+    channel?: string;
+  }): string[] {
+    const { agent, sessionKey, sessionId, channel } = target;
+    const args: string[] = [];
+    if (agent) args.push("--agent", agent);
+    if (sessionKey) args.push("--session-key", sessionKey);
+    if (sessionId) args.push("--session-id", sessionId);
+    if (channel) args.push("--channel", channel);
+    if (!agent && !sessionKey && !sessionId) {
+      args.push("--agent", this.cfg.defaultAgent ?? "main");
+    }
+    return args;
   }
 
   private async tryOpenClawAgent(
     message: string,
-    agentId: string | undefined,
-    session: string | undefined,
+    target: { agent?: string; sessionKey?: string; sessionId?: string; channel?: string },
     state: FlowState,
     nodeTimeoutMs?: number,
   ): Promise<string> {
@@ -998,18 +1045,7 @@ export class FlowRunner {
       throw new Error("openclaw CLI not found — agent nodes require the openclaw CLI to be installed");
     }
 
-    // Target selection mirrors `openclaw agent`'s own selectors, which compose:
-    //   --agent <id>         scopes to a configured agent
-    //   --session-key <key>  selects an exact session
-    // Per OpenClaw: a bare session key is scoped by --agent; an "agent:"-prefixed
-    // key must match --agent if both are given. So we pass through whichever are
-    // set and let OpenClaw enforce consistency, rather than re-asserting it here.
-    // When neither is set, fall back to a configured agent (defaultAgent > "main").
-    const args = ["agent"];
-    if (agentId) args.push("--agent", agentId);
-    if (session) args.push("--session-key", session);
-    if (!agentId && !session) args.push("--agent", this.cfg.defaultAgent ?? "main");
-    args.push("--message", message);
+    const args = ["agent", ...this.buildAgentArgs(target), "--message", message];
 
     // Merge flow-level env vars (state.env) into the child process environment.
     // Set CLAWFLOW_NO_SERVE to prevent the child from binding the webhook port.
@@ -1304,7 +1340,7 @@ export class FlowRunner {
     node: HttpNode,
     state: FlowState,
   ): Promise<{ output: unknown }> {
-    const url = this.resolveTemplate(node.url, state);
+    const url = node.url; // template already interpolated by resolveNodeFields
     const method = node.method ?? "GET";
     let body: string | undefined;
     if (node.body) {
@@ -1320,9 +1356,8 @@ export class FlowRunner {
       "Content-Type": "application/json",
     };
     if (node.headers) {
-      for (const [k, v] of Object.entries(node.headers)) {
-        headers[k] = this.resolveTemplate(v, state);
-      }
+      // values already interpolated by resolveNodeFields (templateEach)
+      Object.assign(headers, node.headers);
     }
     const resp = await fetch(url, { method, headers, body });
     const text = await resp.text();
@@ -1394,16 +1429,12 @@ export class FlowRunner {
         "flow-memory",
       );
     fs.mkdirSync(dir, { recursive: true });
-    const key = this.resolveTemplate(node.key, state).replace(
-      /[^a-zA-Z0-9_-]/g,
-      "_",
-    );
+    // key/value templates already interpolated by resolveNodeFields
+    const key = node.key.replace(/[^a-zA-Z0-9_-]/g, "_");
     const file = path.join(dir, `${key}.json`);
 
     if (node.action === "write") {
-      const value = node.value
-        ? this.resolveTemplate(node.value, state)
-        : undefined;
+      const value = node.value ?? undefined;
       fs.writeFileSync(
         file,
         JSON.stringify({ key, value, ts: Date.now() }, null, 2),
@@ -1438,9 +1469,8 @@ export class FlowRunner {
     approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
   }> {
     if (node.for === "approval") {
-      const prompt = node.prompt
-        ? this.resolveTemplate(node.prompt, state)
-        : `Approve node "${node.name}"?`;
+      // prompt template already interpolated by resolveNodeFields
+      const prompt = node.prompt ?? `Approve node "${node.name}"?`;
       const timeout = node.timeout ?? "24h";
       const expiresAt = new Date(
         Date.now() + parseDuration(timeout),
@@ -1711,8 +1741,9 @@ export class FlowRunner {
     const { promisify } = await import("util");
     const execAsync = promisify(exec);
 
-    const command = this.resolveTemplate(node.command, state);
-    const cwd = node.cwd ? this.resolveTemplate(node.cwd, state) : undefined;
+    // command/cwd templates already interpolated by resolveNodeFields
+    const command = node.command;
+    const cwd = node.cwd ?? undefined;
 
     try {
       const { stdout, stderr } = await execAsync(command, {
@@ -1742,6 +1773,40 @@ export class FlowRunner {
   }
 
   // ---- Template helpers ---------------------------------------------------------
+
+  // Interpolate a node's `template`/`templateEach` fields against state, returning a
+  // shallow clone with those fields resolved (or the original node when nothing is
+  // dynamic). Every other mode — path, expr, children, templateDeep, code, literal —
+  // is passed through: its handler owns resolution, because timing (loop iteration
+  // state), type preservation (deep bodies), or "never interpolate" (code) matter.
+  // Custom steps have no entry here; execCustomStep resolves their fields itself.
+  private resolveNodeFields(node: FlowNode, state: FlowState): FlowNode {
+    const modes = NODE_FIELD_MODES[node.do];
+    if (!modes) return node;
+    const raw = node as unknown as Record<string, unknown>;
+    let clone: Record<string, unknown> | undefined;
+    const patch = (field: string, value: unknown) => {
+      (clone ??= { ...raw })[field] = value;
+    };
+    for (const [field, mode] of Object.entries(modes)) {
+      const val = raw[field];
+      if (val === undefined) continue;
+      if (mode === "template") {
+        if (typeof val === "string") patch(field, this.resolveTemplate(val, state));
+      } else if (mode === "templateEach") {
+        if (Array.isArray(val)) {
+          patch(field, val.map((v) => (typeof v === "string" ? this.resolveTemplate(v, state) : v)));
+        } else if (val !== null && typeof val === "object") {
+          const out: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(val)) {
+            out[k] = typeof v === "string" ? this.resolveTemplate(v, state) : v;
+          }
+          patch(field, out);
+        }
+      }
+    }
+    return (clone ?? raw) as unknown as FlowNode;
+  }
 
   // Deep-resolve templates in an object, preserving types.
   // If a value is a pure template like "{{ foo.bar }}" and resolves to an

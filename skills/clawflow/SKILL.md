@@ -30,7 +30,7 @@ A flow is JSON with a `flow` name, an optional `env` block, and a `nodes` array.
 | Node | Purpose | Key fields |
 |------|---------|------------|
 | `ai` | Single LLM call, structured or freeform | `prompt`, `schema`, `model`, `input`, `attachments` |
-| `agent` | Delegate to a real OpenClaw agent (with tools, browser, etc.) | `task`, `agentId`, `session`, `tools` |
+| `agent` | Delegate to a real OpenClaw agent (with tools, browser, etc.) | `task`, `agent`, `sessionKey`, `sessionId`, `channel`, `tools` |
 | `exec` | Run a shell command deterministically (no AI) | `command`, `cwd` |
 | `branch` | Multi-way routing with inline sub-flows per path | `on`, `paths`, `default` |
 | `condition` | If/else with sub-node blocks that reconverge | `if`, `then`, `else` |
@@ -52,8 +52,12 @@ A flow is JSON with a `flow` name, an optional `env` block, and a `nodes` array.
 - Use `do: exec` for deterministic operations (scripts, file processing, CLI tools) — never use `do: agent` for pure shell commands
 - Use `do: agent` for tasks that need tools (browser, exec, memory, MCP, CLI) — delegates to a real OpenClaw agent
 - Use `do: ai` for structured extraction and single-turn LLM calls
-- Set `agentId: "clawflow"` on agent nodes to target a configured OpenClaw agent (a plain slug like `main`/`clawflow`, never a session key)
-- Set `session: "agent:main:slack:channel:agent"` on agent nodes to run inside a specific existing session (e.g. a channel) — maps to `openclaw agent --session-key`. An `agent:`-prefixed key is self-scoping; a bare key (e.g. `incident-42`) is scoped by `agentId`. May be combined with `agentId`
+- Agent-node selector fields mirror the `openclaw agent` CLI flags 1:1: `agent`→`--agent`, `sessionKey`→`--session-key`, `sessionId`→`--session-id`, `channel`→`--channel` (the old names `agentId`/`session` are deprecated aliases for `agent`/`sessionKey` and still work)
+- Set `agent: "clawflow"` on agent nodes to target a configured OpenClaw agent (a plain slug like `main`/`clawflow`, never a session key)
+- Set `sessionKey: "agent:main:slack:channel:agent"` on agent nodes to run inside a specific existing session (e.g. a channel) — maps to `--session-key`. An `agent:`-prefixed key is self-scoping; a bare key (e.g. `incident-42`) is scoped by `agent`. May be combined with `agent`
+- Set `sessionId: "sess-9"` to target one explicit session by id (maps to `--session-id`) — the most specific selector, scoped by `agent`. Use `sessionKey` for channel/self-scoping keys, `sessionId` to resume a known id
+- Set `channel: "slack"` to deliver the agent's reply on a specific channel (maps to `--channel`); omit to use the session's own channel
+- `agent`, `sessionKey`, `sessionId`, and `channel` all support templates, so a prior node can compute the target (e.g. `agent: "{{ route.slug }}"`)
 - Use `do: wait` with `for: approval` before any side effects that need human review — it pauses the flow, provides a token, and shows preview data to the approver
 - Use `do: wait` with `for: event` to wait for external events (webhooks, signals)
 - `do: condition` for boolean if/else, `do: branch` for multi-way value matching — both run inline sub-flows and reconverge
@@ -316,7 +320,7 @@ extract (agent) → parse (ai+schema) → loop:
 
 ### do: agent — exec approval setup
 
-Agent nodes delegate to a real OpenClaw agent via `openclaw agent --agent <id> --message <task>` (or `--session-key <key>` when you set `session` instead of `agentId`). By default, the spawned agent uses the "main" profile, which may prompt for exec approval on every shell command — blocking unattended flows.
+Agent nodes delegate to a real OpenClaw agent via `openclaw agent --agent <id> --message <task>` (or `--session-key <key>` when you set `sessionKey` instead of `agent`). By default, the spawned agent uses the "main" profile, which may prompt for exec approval on every shell command — blocking unattended flows.
 
 To run agent nodes without interactive prompts, create a dedicated `clawflow` agent with full exec access:
 
@@ -364,20 +368,20 @@ openclaw approvals set --stdin <<'EOF'
 EOF
 ```
 
-**4. Set `agentId` on agent nodes:**
+**4. Set `agent` on agent nodes:**
 
 ```json
 {
   "name": "research_topic",
   "do": "agent",
-  "agentId": "clawflow",
+  "agent": "clawflow",
   "task": "Research the latest trends in {{ inputs.topic }}",
   "timeout": "240s",
   "output": "research"
 }
 ```
 
-- `agentId` defaults to `"main"` if omitted (backward compatible)
+- `agent` defaults to `"main"` if omitted (backward compatible)
 - `security: "full"` + `ask: "off"` + `askFallback: "full"` = no prompts, all exec allowed
 - The main interactive agent stays locked down with its own allowlist
 - `exec-approvals.json` is per-agent — the `clawflow` entry only affects flow-spawned runs
