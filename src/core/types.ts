@@ -66,16 +66,36 @@ export interface BaseNode {
   timeout?: string | number; // e.g. "30s", or ms integer
 }
 
-// Helper: compile-time check that a key tuple matches exactly the own keys of T (minus BaseNode).
-// If a key is added to an interface but not the tuple (or vice versa), this produces a type error
-// on the corresponding _XCheck variable below.
+// ---- Field resolution modes -----------------------------------------------------
+// Single source of truth for how each node field is treated when a flow runs.
+// Both the runner (template interpolation) and the validator (template-ref checks)
+// read the per-node `*_FIELD_MODES` maps below, so "which fields are dynamic" is
+// declared once — not re-decided in every exec handler and again in the validator.
+export type FieldMode =
+  // A string interpolated with {{ }} templates at exec time (resolveTemplate).
+  | "template"
+  // An array of template strings, or a map of string values. Each element is resolved.
+  | "templateEach"
+  // A string-or-object deep-resolved, type-preserving (resolveBodyObject). The owning
+  // handler performs this resolution; the generic pass leaves the field untouched.
+  | "templateDeep"
+  // A raw dotted state path read via getPath (never {{ }}-interpolated).
+  | "path"
+  // A JS expression evaluated against state (condition `if`).
+  | "expr"
+  // A FlowNode[] sub-block, resolved lazily as it executes (loop/branch/condition/parallel).
+  | "children"
+  // Executable source, passed through untouched and run (code `run`).
+  | "code"
+  // Passed through untouched: enums, numbers, output shapes, tool lists.
+  | "literal";
+
+// A field-mode map must list EXACTLY the own keys of T (minus BaseNode). Adding a
+// field to an interface without classifying it — or classifying one that doesn't
+// exist — is a compile error. This is what stops a new value field from silently
+// shipping without interpolation (the agentId/session class of bug).
 type OwnKeys<T extends BaseNode> = Exclude<keyof T, keyof BaseNode>;
-type CheckKeys<T extends BaseNode, K extends readonly string[]> =
-  [OwnKeys<T>] extends [K[number]]
-    ? [K[number]] extends [OwnKeys<T>]
-      ? true
-      : "Extra key(s) in tuple not on interface"
-    : "Missing key(s) from interface in tuple";
+type FieldModeMap<T extends BaseNode> = Record<OwnKeys<T>, FieldMode>;
 
 // ---- Node Types -----------------------------------------------------------------
 
@@ -96,28 +116,69 @@ export interface AiNode extends BaseNode {
   /** File paths (images, PDFs) to include as multimodal content. Supports templates. */
   attachments?: string[];
 }
-const AI_KEYS = ["prompt", "input", "schema", "model", "provider", "temperature", "maxTokens", "attachments"] as const;
-const _aiCheck: CheckKeys<AiNode, typeof AI_KEYS> = true;
+const AI_FIELD_MODES: FieldModeMap<AiNode> = {
+  prompt: "template",
+  input: "path",
+  schema: "literal",
+  model: "literal",
+  provider: "literal",
+  temperature: "literal",
+  maxTokens: "literal",
+  attachments: "templateEach",
+};
 
 export interface AgentNode extends BaseNode {
   do: "agent";
   task: string;
   input?: string;
   tools?: string[];
-  /** OpenClaw agent ID to delegate to (e.g. "main", "clawflow"). A plain slug, never a session key. Defaults to "main" if neither this nor `session` is set. */
+  // Field names mirror `openclaw agent`'s flags 1:1 (agent→--agent, sessionKey→
+  // --session-key, sessionId→--session-id, channel→--channel). `agentId`/`session`
+  // are the pre-1.3.1 names, kept as deprecated aliases (the new name wins if both set).
+  /**
+   * OpenClaw agent slug to delegate to (e.g. "main", "clawflow"), mapped to
+   * `openclaw agent --agent`. A plain slug, never a session key. Defaults to
+   * "main" if no target (`agent`/`sessionKey`/`sessionId`) is set.
+   */
+  agent?: string;
+  /** @deprecated Renamed to `agent` (aligns with `--agent`). Still accepted; `agent` wins if both are set. */
   agentId?: string;
   /**
    * OpenClaw session key to target, mapped to `openclaw agent --session-key`.
    * Use this to run inside a specific existing session — a channel, a named
    * agent session — rather than a fresh turn. "agent:"-prefixed keys (e.g.
    * "agent:main:slack:channel:agent") are self-scoping; a bare key (e.g.
-   * "incident-42") is scoped by `agentId` (or the default agent). May be
-   * combined with `agentId` — OpenClaw requires them to be consistent.
+   * "incident-42") is scoped by `agent` (or the default agent). May be
+   * combined with `agent` — OpenClaw requires them to be consistent.
    */
+  sessionKey?: string;
+  /** @deprecated Renamed to `sessionKey` (aligns with `--session-key`). Still accepted; `sessionKey` wins if both are set. */
   session?: string;
+  /**
+   * Explicit OpenClaw session id, mapped to `openclaw agent --session-id`. The
+   * most specific target: it names one session directly (scoped by `agent`).
+   * Prefer `sessionKey` for channel/self-scoping keys; use this to resume a known id.
+   */
+  sessionId?: string;
+  /**
+   * Delivery channel for the agent's reply, mapped to `openclaw agent --channel`
+   * (e.g. "slack", "telegram", "whatsapp"). Omit to use the session's own channel.
+   */
+  channel?: string;
 }
-const AGENT_KEYS = ["task", "input", "tools", "agentId", "session"] as const;
-const _agentCheck: CheckKeys<AgentNode, typeof AGENT_KEYS> = true;
+const AGENT_FIELD_MODES: FieldModeMap<AgentNode> = {
+  task: "template",
+  input: "path",
+  tools: "literal",
+  // Selector fields map to CLI flags and are interpolated so a value computed by a
+  // prior node (e.g. "{{ route.agent_slug }}") can target the delegate/reply channel.
+  agent: "template",
+  agentId: "template", // deprecated alias for `agent`
+  sessionKey: "template",
+  session: "template", // deprecated alias for `sessionKey`
+  sessionId: "template",
+  channel: "template",
+};
 
 export interface BranchNode extends BaseNode {
   do: "branch";
@@ -125,8 +186,11 @@ export interface BranchNode extends BaseNode {
   paths: Record<string, FlowNode[]>; // value -> sub-flow to execute
   default?: FlowNode[]; // sub-flow if no path matches
 }
-const BRANCH_KEYS = ["on", "paths", "default"] as const;
-const _branchCheck: CheckKeys<BranchNode, typeof BRANCH_KEYS> = true;
+const BRANCH_FIELD_MODES: FieldModeMap<BranchNode> = {
+  on: "path",
+  paths: "children",
+  default: "children",
+};
 
 export interface LoopNode extends BaseNode {
   do: "loop";
@@ -134,16 +198,21 @@ export interface LoopNode extends BaseNode {
   as: string; // variable name for current item
   nodes: FlowNode[];
 }
-const LOOP_KEYS = ["over", "as", "nodes"] as const;
-const _loopCheck: CheckKeys<LoopNode, typeof LOOP_KEYS> = true;
+const LOOP_FIELD_MODES: FieldModeMap<LoopNode> = {
+  over: "path",
+  as: "literal",
+  nodes: "children",
+};
 
 export interface ParallelNode extends BaseNode {
   do: "parallel";
   nodes: FlowNode[];
   mode?: "all" | "race"; // "all" = wait for all, "race" = first wins
 }
-const PARALLEL_KEYS = ["nodes", "mode"] as const;
-const _parallelCheck: CheckKeys<ParallelNode, typeof PARALLEL_KEYS> = true;
+const PARALLEL_FIELD_MODES: FieldModeMap<ParallelNode> = {
+  nodes: "children",
+  mode: "literal",
+};
 
 export interface HttpNode extends BaseNode {
   do: "http";
@@ -152,8 +221,12 @@ export interface HttpNode extends BaseNode {
   body?: string | Record<string, unknown>;
   headers?: Record<string, string>;
 }
-const HTTP_KEYS = ["url", "method", "body", "headers"] as const;
-const _httpCheck: CheckKeys<HttpNode, typeof HTTP_KEYS> = true;
+const HTTP_FIELD_MODES: FieldModeMap<HttpNode> = {
+  url: "template",
+  method: "literal",
+  body: "templateDeep",
+  headers: "templateEach",
+};
 
 export interface MemoryNode extends BaseNode {
   do: "memory";
@@ -161,8 +234,11 @@ export interface MemoryNode extends BaseNode {
   key: string;
   value?: string; // required for write
 }
-const MEMORY_KEYS = ["action", "key", "value"] as const;
-const _memoryCheck: CheckKeys<MemoryNode, typeof MEMORY_KEYS> = true;
+const MEMORY_FIELD_MODES: FieldModeMap<MemoryNode> = {
+  action: "literal",
+  key: "template",
+  value: "template",
+};
 
 /**
  * wait — pause for human approval or external event.
@@ -191,23 +267,30 @@ export interface WaitNode extends BaseNode {
   event?: string; // event type to match (for: event)
   timeout?: string; // e.g. "24h", "5m" -- fail if exceeded
 }
-const WAIT_KEYS = ["for", "prompt", "preview", "event"] as const;
-const _waitCheck: CheckKeys<WaitNode, typeof WAIT_KEYS> = true;
+const WAIT_FIELD_MODES: FieldModeMap<WaitNode> = {
+  for: "literal",
+  prompt: "template",
+  preview: "templateDeep",
+  event: "literal",
+};
 
 export interface SleepNode extends BaseNode {
   do: "sleep";
   duration: string; // e.g. "30s", "5m", "2h", "1d"
 }
-const SLEEP_KEYS = ["duration"] as const;
-const _sleepCheck: CheckKeys<SleepNode, typeof SLEEP_KEYS> = true;
+const SLEEP_FIELD_MODES: FieldModeMap<SleepNode> = {
+  duration: "literal",
+};
 
 export interface CodeNode extends BaseNode {
   do: "code";
   run: string;
   input?: string;
 }
-const CODE_KEYS = ["run", "input"] as const;
-const _codeCheck: CheckKeys<CodeNode, typeof CODE_KEYS> = true;
+const CODE_FIELD_MODES: FieldModeMap<CodeNode> = {
+  run: "code",
+  input: "path",
+};
 
 /**
  * exec — run a shell command deterministically, no AI involved.
@@ -225,8 +308,10 @@ export interface ExecNode extends BaseNode {
   command: string;
   cwd?: string; // working directory (resolved via templates)
 }
-const EXEC_KEYS = ["command", "cwd"] as const;
-const _execCheck: CheckKeys<ExecNode, typeof EXEC_KEYS> = true;
+const EXEC_FIELD_MODES: FieldModeMap<ExecNode> = {
+  command: "template",
+  cwd: "template",
+};
 
 /**
  * condition — if/else with sub-node blocks that reconverge.
@@ -261,29 +346,44 @@ export interface ConditionNode extends BaseNode {
   then: FlowNode[]; // nodes to run when condition is true
   else?: FlowNode[]; // nodes to run when condition is false
 }
-const CONDITION_KEYS = ["if", "then", "else"] as const;
-const _conditionCheck: CheckKeys<ConditionNode, typeof CONDITION_KEYS> = true;
+const CONDITION_FIELD_MODES: FieldModeMap<ConditionNode> = {
+  if: "expr",
+  then: "children",
+  else: "children",
+};
 
-// ---- Allowed Node Keys (derived from interfaces above) --------------------------
-// Used by the validator to reject unknown fields. The ExactKeys constraint ensures
-// a compile error if a key list drifts from its interface.
+// ---- Field-mode registry (the single source of truth) ---------------------------
+// Maps each built-in node type to its per-field resolution modes. The runner reads
+// this to interpolate the right fields; the validator reads it to know which fields
+// carry {{ }} templates. Add a node type here and both consumers pick it up.
+
+export const NODE_FIELD_MODES: Record<string, Record<string, FieldMode>> = {
+  ai:        AI_FIELD_MODES,
+  agent:     AGENT_FIELD_MODES,
+  branch:    BRANCH_FIELD_MODES,
+  condition: CONDITION_FIELD_MODES,
+  loop:      LOOP_FIELD_MODES,
+  parallel:  PARALLEL_FIELD_MODES,
+  http:      HTTP_FIELD_MODES,
+  memory:    MEMORY_FIELD_MODES,
+  wait:      WAIT_FIELD_MODES,
+  sleep:     SLEEP_FIELD_MODES,
+  code:      CODE_FIELD_MODES,
+  exec:      EXEC_FIELD_MODES,
+};
+
+// ---- Allowed Node Keys (derived from the field-mode registry) -------------------
+// Used by the validator to reject unknown fields. Own keys come straight from each
+// node's field-mode map, so the allow-list can never drift from the classification.
 
 const BASE_KEYS: readonly string[] = ["name", "do", "output", "retry", "timeout"];
 
-export const NODE_KEYS: Record<string, ReadonlySet<string>> = {
-  ai:        new Set([...BASE_KEYS, ...AI_KEYS]),
-  agent:     new Set([...BASE_KEYS, ...AGENT_KEYS]),
-  branch:    new Set([...BASE_KEYS, ...BRANCH_KEYS]),
-  condition: new Set([...BASE_KEYS, ...CONDITION_KEYS]),
-  loop:      new Set([...BASE_KEYS, ...LOOP_KEYS]),
-  parallel:  new Set([...BASE_KEYS, ...PARALLEL_KEYS]),
-  http:      new Set([...BASE_KEYS, ...HTTP_KEYS]),
-  memory:    new Set([...BASE_KEYS, ...MEMORY_KEYS]),
-  wait:      new Set([...BASE_KEYS, ...WAIT_KEYS]),
-  sleep:     new Set([...BASE_KEYS, ...SLEEP_KEYS]),
-  code:      new Set([...BASE_KEYS, ...CODE_KEYS]),
-  exec:      new Set([...BASE_KEYS, ...EXEC_KEYS]),
-};
+export const NODE_KEYS: Record<string, ReadonlySet<string>> = Object.fromEntries(
+  Object.entries(NODE_FIELD_MODES).map(([type, modes]) => [
+    type,
+    new Set([...BASE_KEYS, ...Object.keys(modes)]),
+  ]),
+);
 
 // ---- Runtime Types --------------------------------------------------------------
 
