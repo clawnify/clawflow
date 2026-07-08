@@ -1244,6 +1244,53 @@ describe("validateFlow", () => {
     const result = validateFlow(flow);
     assert.equal(result.ok, true);
   });
+
+  it("accepts an agent node with a session key", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-session",
+      nodes: [{
+        name: "reply",
+        do: "agent" as const,
+        task: "answer",
+        session: "agent:main:slack:channel:agent",
+        output: "r",
+      }] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, true, JSON.stringify(result.errors));
+  });
+
+  it("rejects a session-key-shaped agentId (should use session)", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-bad-id",
+      nodes: [{
+        name: "reply",
+        do: "agent" as const,
+        task: "answer",
+        agentId: "agent:main:slack:channel:agent",
+        output: "r",
+      }] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((e) => e.message.includes("session-key-shaped")));
+  });
+
+  it("allows combining agentId with a bare session key (agent scopes the key)", () => {
+    const flow: FlowDefinition = {
+      flow: "agent-both",
+      nodes: [{
+        name: "reply",
+        do: "agent" as const,
+        task: "answer",
+        agentId: "ops",
+        session: "incident-42",
+        output: "r",
+      }] as any,
+    };
+    const result = validateFlow(flow);
+    assert.equal(result.ok, true, JSON.stringify(result.errors));
+  });
 });
 
 // ---- Attachments (multimodal) -------------------------------------------------------

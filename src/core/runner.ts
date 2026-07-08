@@ -976,13 +976,14 @@ export class FlowRunner {
       ? parseDuration(node.timeout)
       : undefined;
 
-    const cliResult = await this.tryOpenClawAgent(fullPrompt, node.agentId, state, timeoutMs);
+    const cliResult = await this.tryOpenClawAgent(fullPrompt, node.agentId, node.session, state, timeoutMs);
     return { output: this.autoParseJson(cliResult) };
   }
 
   private async tryOpenClawAgent(
     message: string,
     agentId: string | undefined,
+    session: string | undefined,
     state: FlowState,
     nodeTimeoutMs?: number,
   ): Promise<string> {
@@ -997,9 +998,18 @@ export class FlowRunner {
       throw new Error("openclaw CLI not found — agent nodes require the openclaw CLI to be installed");
     }
 
-    // Resolution: node.agentId > plugin config defaultAgent > "main"
-    const effectiveAgent = agentId ?? this.cfg.defaultAgent ?? "main";
-    const args = ["agent", "--agent", effectiveAgent, "--message", message];
+    // Target selection mirrors `openclaw agent`'s own selectors, which compose:
+    //   --agent <id>         scopes to a configured agent
+    //   --session-key <key>  selects an exact session
+    // Per OpenClaw: a bare session key is scoped by --agent; an "agent:"-prefixed
+    // key must match --agent if both are given. So we pass through whichever are
+    // set and let OpenClaw enforce consistency, rather than re-asserting it here.
+    // When neither is set, fall back to a configured agent (defaultAgent > "main").
+    const args = ["agent"];
+    if (agentId) args.push("--agent", agentId);
+    if (session) args.push("--session-key", session);
+    if (!agentId && !session) args.push("--agent", this.cfg.defaultAgent ?? "main");
+    args.push("--message", message);
 
     // Merge flow-level env vars (state.env) into the child process environment.
     // Set CLAWFLOW_NO_SERVE to prevent the child from binding the webhook port.

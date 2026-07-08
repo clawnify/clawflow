@@ -104,10 +104,19 @@ export interface AgentNode extends BaseNode {
   task: string;
   input?: string;
   tools?: string[];
-  /** OpenClaw agent ID to delegate to (e.g. "main", "clawflow"). Uses OpenClaw's default routing if omitted. */
+  /** OpenClaw agent ID to delegate to (e.g. "main", "clawflow"). A plain slug, never a session key. Defaults to "main" if neither this nor `session` is set. */
   agentId?: string;
+  /**
+   * OpenClaw session key to target, mapped to `openclaw agent --session-key`.
+   * Use this to run inside a specific existing session — a channel, a named
+   * agent session — rather than a fresh turn. "agent:"-prefixed keys (e.g.
+   * "agent:main:slack:channel:agent") are self-scoping; a bare key (e.g.
+   * "incident-42") is scoped by `agentId` (or the default agent). May be
+   * combined with `agentId` — OpenClaw requires them to be consistent.
+   */
+  session?: string;
 }
-const AGENT_KEYS = ["task", "input", "tools", "agentId"] as const;
+const AGENT_KEYS = ["task", "input", "tools", "agentId", "session"] as const;
 const _agentCheck: CheckKeys<AgentNode, typeof AGENT_KEYS> = true;
 
 export interface BranchNode extends BaseNode {

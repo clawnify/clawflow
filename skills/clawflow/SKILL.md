@@ -30,7 +30,7 @@ A flow is JSON with a `flow` name, an optional `env` block, and a `nodes` array.
 | Node | Purpose | Key fields |
 |------|---------|------------|
 | `ai` | Single LLM call, structured or freeform | `prompt`, `schema`, `model`, `input`, `attachments` |
-| `agent` | Delegate to a real OpenClaw agent (with tools, browser, etc.) | `task`, `agentId`, `tools` |
+| `agent` | Delegate to a real OpenClaw agent (with tools, browser, etc.) | `task`, `agentId`, `session`, `tools` |
 | `exec` | Run a shell command deterministically (no AI) | `command`, `cwd` |
 | `branch` | Multi-way routing with inline sub-flows per path | `on`, `paths`, `default` |
 | `condition` | If/else with sub-node blocks that reconverge | `if`, `then`, `else` |
@@ -52,7 +52,8 @@ A flow is JSON with a `flow` name, an optional `env` block, and a `nodes` array.
 - Use `do: exec` for deterministic operations (scripts, file processing, CLI tools) — never use `do: agent` for pure shell commands
 - Use `do: agent` for tasks that need tools (browser, exec, memory, MCP, CLI) — delegates to a real OpenClaw agent
 - Use `do: ai` for structured extraction and single-turn LLM calls
-- Set `agentId: "clawflow"` on agent nodes to target a specific OpenClaw agent ID
+- Set `agentId: "clawflow"` on agent nodes to target a configured OpenClaw agent (a plain slug like `main`/`clawflow`, never a session key)
+- Set `session: "agent:main:slack:channel:agent"` on agent nodes to run inside a specific existing session (e.g. a channel) — maps to `openclaw agent --session-key`. An `agent:`-prefixed key is self-scoping; a bare key (e.g. `incident-42`) is scoped by `agentId`. May be combined with `agentId`
 - Use `do: wait` with `for: approval` before any side effects that need human review — it pauses the flow, provides a token, and shows preview data to the approver
 - Use `do: wait` with `for: event` to wait for external events (webhooks, signals)
 - `do: condition` for boolean if/else, `do: branch` for multi-way value matching — both run inline sub-flows and reconverge
@@ -315,7 +316,7 @@ extract (agent) → parse (ai+schema) → loop:
 
 ### do: agent — exec approval setup
 
-Agent nodes delegate to a real OpenClaw agent via `openclaw agent --agent <id> --message <task>`. By default, the spawned agent uses the "main" profile, which may prompt for exec approval on every shell command — blocking unattended flows.
+Agent nodes delegate to a real OpenClaw agent via `openclaw agent --agent <id> --message <task>` (or `--session-key <key>` when you set `session` instead of `agentId`). By default, the spawned agent uses the "main" profile, which may prompt for exec approval on every shell command — blocking unattended flows.
 
 To run agent nodes without interactive prompts, create a dedicated `clawflow` agent with full exec access:
 

@@ -212,6 +212,8 @@ function validateNodeFields(
       const n = node as AgentNode;
       if (!n.task) e("task", `agent node "${node.name}" requires "task"`);
       if ("model" in node) e("model", `agent node "${node.name}" does not support "model" — configure the model on the openclaw agent instead`);
+      if (typeof n.agentId === "string" && n.agentId.includes(":"))
+        e("agentId", `agent node "${node.name}" has a session-key-shaped "agentId" ("${n.agentId}") — "agentId" is a plain agent slug (e.g. "main"). Use "session" for a session key like "agent:main:slack:channel:agent".`);
       break;
     }
     case "branch": {
