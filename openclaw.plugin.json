@@ -2,7 +2,7 @@
   "id": "clawflow",
   "name": "ClawFlow",
   "description": "The n8n for agents. Declarative, AI-native workflow engine — LLM-writable, Cloudflare-portable.",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "skills": [
     "./skills/clawflow"
   ],
@@ -125,6 +125,11 @@
               "allow",
               "deny"
             ]
+          },
+          "gateMutations": {
+            "type": "boolean",
+            "default": true,
+            "description": "Gate flow authoring/publishing (flow_create/edit/publish/delete) behind approval on every call, independently of `enabled` (which governs flow_run). Set false to disable."
           }
         }
       }

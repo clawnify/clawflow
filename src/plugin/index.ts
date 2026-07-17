@@ -117,13 +117,42 @@ function register(api: PluginApi) {
       : 5 * 60_000;
   const approvalTimeoutBehavior: "allow" | "deny" =
     approvalCfg.timeoutBehavior === "allow" ? "allow" : "deny";
+  // Intrinsic mutation gate: authoring/publishing/deleting a flow is a write
+  // action that must never run without a human OK, so it is gated on every call
+  // independently of `enabled` (which governs flow_run) and does NOT honor
+  // skipSessionPatterns. Kill-switch: approval.gateMutations=false.
+  const gateMutations = approvalCfg.gateMutations !== false;
+  const MUTATION_VERBS: Record<string, string> = {
+    flow_create: "Create",
+    flow_edit: "Edit",
+    flow_publish: "Publish",
+    flow_delete: "Delete",
+  };
 
-  if (api.registerHook && approvalEnabled) {
+  if (api.registerHook && (approvalEnabled || gateMutations)) {
     api.registerHook(
       "before_tool_call",
       (event) => {
         const toolName = event.toolName ?? event.tool;
-        if (toolName !== "flow_run") return;
+
+        // Flow-authoring tools — always gate (no skipSessionPatterns). No
+        // allow-always persist path, so every call re-prompts.
+        const mutationVerb = toolName ? MUTATION_VERBS[toolName] : undefined;
+        if (gateMutations && mutationVerb) {
+          const mp = (event.params ?? {}) as { file?: string; flow?: string };
+          const name = mp.flow ?? mp.file ?? "inline flow";
+          return {
+            requireApproval: {
+              title: `${mutationVerb} clawflow "${name}"?`.slice(0, 80),
+              description: "Creates, edits, publishes, or deletes a flow definition.",
+              severity: "warning",
+              timeoutMs: approvalTimeoutMs,
+              timeoutBehavior: approvalTimeoutBehavior,
+            },
+          };
+        }
+
+        if (!approvalEnabled || toolName !== "flow_run") return;
 
         const sessionKey = event.context?.sessionKey ?? "";
         if (skipPatterns.some((pattern) => sessionKey.includes(pattern))) {
@@ -145,8 +174,8 @@ function register(api: PluginApi) {
         };
       },
       {
-        name: "clawflow-flow-run-approval",
-        description: "Request user approval before executing flow_run (skippable via approval config).",
+        name: "clawflow-approval-gate",
+        description: "Gate flow_run (skippable) and flow authoring/publishing/deletion (always) behind user approval.",
       },
     );
   } else if (!api.registerHook) {
