@@ -567,6 +567,14 @@ export interface ApprovalConfig {
   timeoutMs?: number;
   /** Action on prompt timeout: `"allow"` or `"deny"`. Default: `"deny"`. */
   timeoutBehavior?: "allow" | "deny";
+  /**
+   * Gate flow-authoring tools (`flow_create` / `flow_edit` / `flow_publish` /
+   * `flow_delete`) behind approval, independently of `enabled` (which governs
+   * `flow_run`). Creating, editing, publishing, or deleting a flow definition
+   * is a write action that should never happen unattended, so this applies on
+   * every call and does NOT honor `skipSessionPatterns`. Default: `true`.
+   */
+  gateMutations?: boolean;
 }
 
 // ---- Model Shorthands -----------------------------------------------------------
