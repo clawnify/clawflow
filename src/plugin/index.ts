@@ -551,6 +551,7 @@ directory. If the flow file already exists, the restore is rejected.`,
   api.registerTool(
     {
       name: "flow_run",
+      catalogMode: "direct-only",
       description: `Run an agentic workflow in the clawflow format.
 
 State model:
@@ -922,6 +923,7 @@ Status values: running | completed | paused | waiting | failed | cancelled`,
   api.registerTool(
     {
       name: "flow_list",
+      catalogMode: "direct-only",
       description: `List all saved flow definitions in the workspace.
 
 Scans the flows directory for .json files and returns a summary of each flow
