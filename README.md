@@ -563,6 +563,18 @@ Eleven tools registered in OpenClaw:
 }
 ```
 
+**Harness adapters:** the eleven tools are implemented harness-neutrally in `FlowOps` (`src/core/ops.ts`), with their names, descriptions, and JSON-schema parameters exported as data (`FLOW_OP_SPECS`). The OpenClaw plugin is a thin registrar over that surface; adapters for other agent runtimes register the same specs and forward calls — in-process via `FlowOps`, or out-of-process via the management API below.
+
+**Management API (optional):** a loopback-only HTTP server exposing the same op surface for out-of-process adapters. Binds `127.0.0.1` only and never starts without a bearer token (`manage.token` config or `CLAWFLOW_ADMIN_TOKEN` env; default port 18794).
+
+```
+GET  /ops           # op specs (name, description, parameters) — discovery
+POST /ops/:name     # execute an op; JSON body = params → { text, details? }
+GET  /ops/health    # health check
+```
+
+**Agent invoker:** `agent` nodes reach their runtime through the `AgentInvoker` interface (`PluginConfig.agentInvoker`). The default is the OpenClaw CLI; embedders and other harnesses supply their own implementation.
+
 ---
 
 ### 2. Standalone Node.js Runner (coming soon)

@@ -512,6 +512,15 @@ export interface ServeConfig {
   flowsDir?: string; // directory containing .json flow files, default workspace/flows
 }
 
+export interface ManageConfig {
+  /** Disable the management API entirely. Default: enabled when a token exists. */
+  enabled?: boolean;
+  /** Port to bind on 127.0.0.1. Default: 18794. */
+  port?: number;
+  /** Bearer token required on every request. Fallback: env CLAWFLOW_ADMIN_TOKEN. */
+  token?: string;
+}
+
 export interface PluginConfig {
   apiKey?: string;
   defaultModel?: string;
@@ -535,8 +544,20 @@ export interface PluginConfig {
   inferenceFn?: InferenceFn;
   /** OpenClaw agent ID for do:agent nodes (e.g. "ops"). Falls back to --local if unset. */
   defaultAgent?: string;
+  /**
+   * How `agent` nodes reach a real agent runtime. Defaults to the OpenClaw CLI
+   * (`OpenClawCliInvoker`); other harnesses supply their own implementation.
+   */
+  agentInvoker?: import("./agent-invoker.js").AgentInvoker;
   /** Optional HTTP server config — exposes a generic run endpoint per flow. */
   serve?: ServeConfig;
+  /**
+   * Optional loopback-only management API — exposes the flow_* operations over
+   * HTTP so out-of-process harness shims (e.g. a Hermes plugin) can register
+   * the same tool surface and forward calls. Requires a bearer token; never
+   * starts without one.
+   */
+  manage?: ManageConfig;
   /**
    * Optional custom step registry. Defaults to the module-level singleton
    * populated by `registerStepType()`. Provide a private registry for
