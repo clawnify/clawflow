@@ -4,8 +4,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
-import { FlowRunner, parseDuration, transpileToCloudflare, validateFlow } from "../src/index.js";
-import type { FlowDefinition, PluginConfig } from "../src/index.js";
+import { FlowRunner, parseDuration, transpileToCloudflare, validateFlow, OpenClawCliInvoker } from "../src/index.js";
+import type { FlowDefinition, PluginConfig, AgentInvoker, AgentTarget, AgentInvokeOptions } from "../src/index.js";
 
 // Use a temp dir for state so tests don't pollute the real store
 const tmpDir = path.join(os.tmpdir(), `ocf-test-${Date.now()}`);
@@ -271,21 +271,47 @@ describe("FlowRunner — agent node field resolution", () => {
   });
 
   it("builds openclaw agent selector args from target fields", () => {
-    const runner = new FlowRunner(cfg) as any;
+    const invoker = new OpenClawCliInvoker({ defaultAgent: "main" }) as any;
     // all selectors pass through in order; --channel is delivery, not a target
     assert.deepEqual(
-      runner.buildAgentArgs({ agent: "ops", sessionKey: "s-key", sessionId: "s-id", channel: "slack" }),
+      invoker.buildArgs({ agent: "ops", sessionKey: "s-key", sessionId: "s-id", channel: "slack" }),
       ["--agent", "ops", "--session-key", "s-key", "--session-id", "s-id", "--channel", "slack"],
     );
     // sessionKey only, no agent → key alone (openclaw scopes it)
-    assert.deepEqual(runner.buildAgentArgs({ sessionKey: "agent:main:slack:c1" }), [
+    assert.deepEqual(invoker.buildArgs({ sessionKey: "agent:main:slack:c1" }), [
       "--session-key", "agent:main:slack:c1",
     ]);
     // no target selector at all → fall back to a routable default agent
-    assert.deepEqual(runner.buildAgentArgs({}), ["--agent", "main"]);
-    assert.deepEqual(runner.buildAgentArgs({ channel: "slack" }), ["--channel", "slack", "--agent", "main"]);
+    assert.deepEqual(invoker.buildArgs({}), ["--agent", "main"]);
+    assert.deepEqual(invoker.buildArgs({ channel: "slack" }), ["--channel", "slack", "--agent", "main"]);
     // a bare sessionId is a target → no default-agent fallback
-    assert.deepEqual(runner.buildAgentArgs({ sessionId: "sess-9" }), ["--session-id", "sess-9"]);
+    assert.deepEqual(invoker.buildArgs({ sessionId: "sess-9" }), ["--session-id", "sess-9"]);
+  });
+
+  it("routes agent nodes through a custom AgentInvoker", async () => {
+    const calls: Array<{ message: string; target: AgentTarget; opts: AgentInvokeOptions }> = [];
+    const fakeInvoker: AgentInvoker = {
+      async invoke(message, target, opts) {
+        calls.push({ message, target, opts });
+        return '{"answer": 42}';
+      },
+    };
+    const flow: FlowDefinition = {
+      flow: "test-agent-invoker",
+      nodes: [
+        { name: "delegate", do: "agent" as const, task: "compute {{ inputs.q }}", agent: "ops", channel: "slack", output: "result" },
+      ],
+    };
+    const runner = new FlowRunner({ ...cfg, agentInvoker: fakeInvoker });
+    const result = await runner.run(flow, { q: "meaning" });
+    assert.equal(result.ok, true);
+    // reply is auto-parsed as JSON
+    assert.deepEqual(result.state.result, { answer: 42 });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].message, "compute meaning");
+    assert.deepEqual(calls[0].target, { agent: "ops", sessionKey: undefined, sessionId: undefined, channel: "slack" });
+    // default timeout applies when the node sets none
+    assert.equal(calls[0].opts.timeoutMs, 120_000);
   });
 });
 

@@ -31,6 +31,7 @@ import {
 } from "./types.js";
 import { StateStore } from "./store.js";
 import { validateFlow } from "./validate.js";
+import { OpenClawCliInvoker, type AgentInvoker } from "./agent-invoker.js";
 import {
   defaultRegistry,
   type CustomStepContext,
@@ -116,11 +117,14 @@ export class FlowRunner {
    * flow-cancel API is wired in, it should call abort() and delete here.
    */
   private abortControllers = new Map<string, AbortController>();
+  private agentInvoker: AgentInvoker;
 
   constructor(cfg: PluginConfig) {
     this.cfg = cfg;
     this.store = new StateStore(cfg.stateDir);
     this.registry = cfg.customSteps ?? defaultRegistry;
+    this.agentInvoker =
+      cfg.agentInvoker ?? new OpenClawCliInvoker({ defaultAgent: cfg.defaultAgent });
   }
 
   // ---- Start a new run ----------------------------------------------------------
@@ -968,8 +972,8 @@ export class FlowRunner {
   }
 
   // ---- do: agent ----------------------------------------------------------------
-  // Delegates to a real OpenClaw agent via CLI. The agent gets full tool access
-  // (browser, exec, memory, MCP, CLI).
+  // Delegates to a real agent via the configured AgentInvoker (default: the
+  // OpenClaw CLI). The agent gets full tool access (browser, exec, memory, MCP, CLI).
 
   private async execAgent(
     node: AgentNode,
@@ -986,7 +990,7 @@ export class FlowRunner {
       ? parseDuration(node.timeout)
       : undefined;
 
-    const cliResult = await this.tryOpenClawAgent(
+    const result = await this.agentInvoker.invoke(
       fullPrompt,
       {
         // new names win; agentId/session are accepted as deprecated aliases
@@ -995,77 +999,12 @@ export class FlowRunner {
         sessionId: node.sessionId,
         channel: node.channel,
       },
-      state,
-      timeoutMs,
+      {
+        timeoutMs: timeoutMs ?? this.cfg.maxNodeDurationMs ?? 120_000,
+        env: (state.env as Record<string, string>) ?? {},
+      },
     );
-    return { output: this.autoParseJson(cliResult) };
-  }
-
-  // Build the `openclaw agent` selector args from a node's target fields. Mirrors
-  // OpenClaw's own selectors, which compose:
-  //   --agent <id>         scopes to a configured agent
-  //   --session-key <key>  an exact session key (agent:<id>:<key>, or scoped to --agent)
-  //   --session-id <id>    the most specific: one explicit session (scoped by --agent)
-  //   --channel <channel>  delivery channel for the reply
-  // We pass through whichever are set and let OpenClaw resolve/enforce consistency
-  // rather than re-asserting it here. When no target selector is set at all, fall
-  // back to a configured agent (defaultAgent > "main") so the call is routable.
-  private buildAgentArgs(target: {
-    agent?: string;
-    sessionKey?: string;
-    sessionId?: string;
-    channel?: string;
-  }): string[] {
-    const { agent, sessionKey, sessionId, channel } = target;
-    const args: string[] = [];
-    if (agent) args.push("--agent", agent);
-    if (sessionKey) args.push("--session-key", sessionKey);
-    if (sessionId) args.push("--session-id", sessionId);
-    if (channel) args.push("--channel", channel);
-    if (!agent && !sessionKey && !sessionId) {
-      args.push("--agent", this.cfg.defaultAgent ?? "main");
-    }
-    return args;
-  }
-
-  private async tryOpenClawAgent(
-    message: string,
-    target: { agent?: string; sessionKey?: string; sessionId?: string; channel?: string },
-    state: FlowState,
-    nodeTimeoutMs?: number,
-  ): Promise<string> {
-    const { execFile } = await import("child_process");
-    const { promisify } = await import("util");
-    const execFileAsync = promisify(execFile);
-
-    // Check if openclaw CLI is available
-    try {
-      await execFileAsync("which", ["openclaw"]);
-    } catch {
-      throw new Error("openclaw CLI not found — agent nodes require the openclaw CLI to be installed");
-    }
-
-    const args = ["agent", ...this.buildAgentArgs(target), "--message", message];
-
-    // Merge flow-level env vars (state.env) into the child process environment.
-    // Set CLAWFLOW_NO_SERVE to prevent the child from binding the webhook port.
-    const env = {
-      ...process.env,
-      ...((state.env as Record<string, string>) ?? {}),
-      CLAWFLOW_NO_SERVE: "1",
-    };
-
-    try {
-      const { stdout } = await execFileAsync("openclaw", args, {
-        timeout: nodeTimeoutMs ?? this.cfg.maxNodeDurationMs ?? 120_000,
-        maxBuffer: 10 * 1024 * 1024, // 10MB
-        env,
-      });
-      return stdout.trim();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`openclaw agent failed: ${msg}`);
-    }
+    return { output: this.autoParseJson(result) };
   }
 
   private autoParseJson(value: unknown): unknown {

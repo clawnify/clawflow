@@ -57,4 +57,11 @@ export type {
 export { parseDuration, MODEL_MAP, DEFAULT_MODEL, NODE_KEYS } from "./core/types.js";
 export { startFlowServer } from "./core/serve.js";
 export type { FlowServerOpts } from "./core/serve.js";
-export type { ServeConfig } from "./core/types.js";
+export type { ServeConfig, ManageConfig } from "./core/types.js";
+export { FlowOps } from "./core/ops.js";
+export type { OpResult, FlowOpSpec } from "./core/ops.js";
+export { FLOW_OP_SPECS } from "./core/op-specs.js";
+export { startManagementServer, DEFAULT_MANAGE_PORT } from "./core/manage.js";
+export type { ManageServerOpts } from "./core/manage.js";
+export { OpenClawCliInvoker } from "./core/agent-invoker.js";
+export type { AgentInvoker, AgentTarget, AgentInvokeOptions } from "./core/agent-invoker.js";
