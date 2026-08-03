@@ -4,6 +4,7 @@ import * as path from "path";
 import type { FlowDefinition, ServeConfig } from "./types.js";
 import type { FlowRunner } from "./runner.js";
 import { validateFlow } from "./validate.js";
+import { readLatestVersion } from "./manage.js";
 
 // ---- Flow Server ----------------------------------------------------------------
 // Lightweight HTTP server that runs flows on POST. Trigger semantics (webhooks,
@@ -18,6 +19,11 @@ import { validateFlow } from "./validate.js";
 export interface FlowServerOpts {
   runner: FlowRunner;
   serve: ServeConfig;
+  /**
+   * Workspace root — where published versions live (.clawflow/versions).
+   * Defaults to $OPENCLAW_WORKSPACE, then cwd, matching resolveFlowsDir.
+   */
+  workspace?: string;
   logger?: {
     info: (msg: string) => void;
     warn: (msg: string) => void;
@@ -31,23 +37,42 @@ const MAX_BODY_BYTES = 1_048_576; // 1 MB
 // (OpenClaw calls it during discovery and again at gateway startup).
 let activeServer: http.Server | null = null;
 
-function resolveFlowsDir(serve: ServeConfig): string {
-  return (
-    serve.flowsDir ??
-    path.join(process.env.OPENCLAW_WORKSPACE ?? process.cwd(), "flows")
-  );
+function resolveWorkspace(workspace?: string): string {
+  return workspace ?? process.env.OPENCLAW_WORKSPACE ?? process.cwd();
 }
 
+function resolveFlowsDir(serve: ServeConfig, workspace: string): string {
+  return serve.flowsDir ?? path.join(workspace, "flows");
+}
+
+/**
+ * Resolve what an incoming trigger should execute: the latest PUBLISHED
+ * version when the flow has one, else the draft.
+ *
+ * Same precedence as the flow_run tool — a webhook and an agent run must never
+ * execute different definitions of the same flow, or "publish" means nothing
+ * for every off-box caller (webhooks, HTTP triggers, the dashboard).
+ * Unpublished flows still run from the draft so a flow works the moment it's
+ * written.
+ */
 function loadFlow(
+  workspace: string,
   flowsDir: string,
   flowName: string,
-): FlowDefinition | null {
+): { def: FlowDefinition; source: string } | null {
   const safe = flowName.replace(/[^a-zA-Z0-9_-]/g, "");
   if (!safe) return null;
+
+  const latest = readLatestVersion(workspace, safe);
+  if (latest) return { def: latest.def, source: `v${latest.version}` };
+
   const file = path.join(flowsDir, `${safe}.json`);
   if (!fs.existsSync(file)) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as FlowDefinition;
+    return {
+      def: JSON.parse(fs.readFileSync(file, "utf8")) as FlowDefinition,
+      source: "draft (no published versions)",
+    };
   } catch {
     return null;
   }
@@ -89,7 +114,8 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
 
   const { runner, serve, logger } = opts;
   const basePath = (serve.path ?? "/flows").replace(/\/+$/, "");
-  const flowsDir = resolveFlowsDir(serve);
+  const workspace = resolveWorkspace(opts.workspace);
+  const flowsDir = resolveFlowsDir(serve, workspace);
   const log = logger ?? {
     info: console.log,
     warn: console.warn,
@@ -150,11 +176,12 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
     const flowName = match[1];
 
     try {
-      const flowDef = loadFlow(flowsDir, flowName);
-      if (!flowDef) {
+      const loaded = loadFlow(workspace, flowsDir, flowName);
+      if (!loaded) {
         json(res, 404, { error: `Flow not found: ${flowName}` });
         return;
       }
+      const flowDef = loaded.def;
 
       // Parse request body — entire body becomes the flow's inputs payload.
       let inputs: unknown = {};
@@ -170,7 +197,7 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
 
       // Fire-and-forget: start the flow, return immediately with instanceId
       const instanceId = crypto.randomUUID();
-      log.info(`[clawflow] run → ${flowName} (${instanceId})`);
+      log.info(`[clawflow] run → ${flowName} ${loaded.source} (${instanceId})`);
 
       // Respond 202 before the flow runs
       json(res, 202, { ok: true, instanceId, flow: flowName });

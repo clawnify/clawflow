@@ -566,6 +566,10 @@ flows/
 
 **Rules:**
 - `flow_run` uses the latest published version by default. Falls back to draft if no versions exist.
+- Incoming triggers (`POST /flows/:name/run` on the flow server — webhooks, HTTP
+  triggers, dashboard runs) resolve the same way: latest published version, draft
+  only when nothing is published. So a draft edit does not change what a live
+  trigger executes once the flow has been published at least once.
 - `flow_run file: "my-flow" draft: true` — explicitly run the working copy
 - `flow_run file: "my-flow" version: 2` — run a specific version
 - `flow_read file: "my-flow" version: 1` — inspect a specific published version

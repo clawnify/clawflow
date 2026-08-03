@@ -119,9 +119,9 @@ describe("publishDraft", () => {
   });
 });
 
-// ---- POST /flows/validate (flow server) -------------------------------------------
+// ---- flow server routes (validate + run resolution) --------------------------------
 
-describe("flow server validate route", () => {
+describe("flow server routes", () => {
   let server: ReturnType<typeof startFlowServer>;
   let base: string;
 
@@ -133,6 +133,7 @@ describe("flow server validate route", () => {
     server = startFlowServer({
       runner,
       serve: { port: 0, path: "/flows" },
+      workspace,
       logger: { info: () => {}, warn: () => {}, error: () => {} },
     });
     await new Promise<void>((resolve) => server.on("listening", resolve));
@@ -208,6 +209,38 @@ describe("flow server validate route", () => {
       body: JSON.stringify([1, 2]),
     });
     assert.equal(bad2.status, 400);
+  });
+
+  // The run route must resolve the same definition flow_run would: published
+  // version first, draft only when nothing is published. A corrupted draft is
+  // the discriminator — if the server still answers 202, it never read it.
+  it("runs the latest published version, not the draft", async () => {
+    writeDraft("srv-published");
+    publishDraft(workspace, "srv-published");
+    fs.writeFileSync(
+      path.join(workspace, "flows", "srv-published.json"),
+      "{ not json at all",
+    );
+
+    const res = await fetch(`${base}/srv-published/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(res.status, 202);
+    const body = (await res.json()) as { ok: boolean; flow: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.flow, "srv-published");
+  });
+
+  it("falls back to the draft when nothing is published", async () => {
+    writeDraft("srv-draft-only");
+    const res = await fetch(`${base}/srv-draft-only/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(res.status, 202);
   });
 
   it("does not shadow the run route", async () => {
