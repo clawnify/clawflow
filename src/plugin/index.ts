@@ -5,6 +5,13 @@ import { FlowRunner, sendEvent } from "../core/runner.js";
 
 import { startFlowServer } from "../core/serve.js";
 import { validateFlow } from "../core/validate.js";
+import {
+  publishDraft,
+  listVersions as listVersionsCore,
+  readLatestVersion as readLatestVersionCore,
+  readVersion as readVersionCore,
+  resolveFlowFile as resolveFlowFileCore,
+} from "../core/manage.js";
 import type { FlowDefinition, FlowNode, PluginConfig, BranchNode, ConditionNode, LoopNode, ParallelNode } from "../core/types.js";
 
 // ---- OpenClaw Plugin: clawflow ---------------------------------------------------
@@ -185,47 +192,27 @@ function register(api: PluginApi) {
   }
 
   // ---- Shared helpers ------------------------------------------------------------
+  // Draft/version semantics live in core/manage.ts (engine-owned, shared with
+  // out-of-process callers); these closures just bind the plugin's workspace.
 
   /** Resolve a file param to an absolute path using workspace conventions. */
   function resolveFlowFile(file: string): string {
-    const base = workspace;
-    if (file.startsWith("/")) return file;
-    if (file.includes("/")) return path.join(base, file);
-    const name = file.replace(/\.json$/, "");
-    return path.join(base, "flows", `${name}.json`);
-  }
-
-  /** Get the versions directory for a flow name. */
-  function versionsDir(flowName: string): string {
-    const base = workspace;
-    return path.join(base, ".clawflow", "versions", flowName);
+    return resolveFlowFileCore(workspace, file);
   }
 
   /** List all published version numbers for a flow, sorted ascending. */
   function listVersions(flowName: string): number[] {
-    const dir = versionsDir(flowName);
-    if (!fs.existsSync(dir)) return [];
-    return fs.readdirSync(dir)
-      .filter((f: string) => /^\d+\.json$/.test(f))
-      .map((f: string) => parseInt(f, 10))
-      .sort((a: number, b: number) => a - b);
+    return listVersionsCore(workspace, flowName);
   }
 
   /** Read a specific published version. Returns null if not found. */
   function readVersion(flowName: string, version: number): FlowDefinition | null {
-    const file = path.join(versionsDir(flowName), `${version}.json`);
-    if (!fs.existsSync(file)) return null;
-    return JSON.parse(fs.readFileSync(file, "utf-8")) as FlowDefinition;
+    return readVersionCore(workspace, flowName, version);
   }
 
   /** Get the latest published version definition. Returns null if none published. */
   function readLatestVersion(flowName: string): { version: number; def: FlowDefinition } | null {
-    const versions = listVersions(flowName);
-    if (versions.length === 0) return null;
-    const latest = versions[versions.length - 1];
-    const def = readVersion(flowName, latest);
-    if (!def) return null;
-    return { version: latest, def };
+    return readLatestVersionCore(workspace, flowName);
   }
 
   // ---- flow_create --------------------------------------------------------------
@@ -1262,7 +1249,6 @@ modify the draft without affecting published versions.`,
         params: { file: string },
       ) {
         const fs = await import("fs");
-        const pathMod = await import("path");
 
         const abs = resolveFlowFile(params.file);
         if (!fs.existsSync(abs)) {
@@ -1297,30 +1283,20 @@ modify the draft without affecting published versions.`,
           };
         }
 
-        const flowName = pathMod.basename(abs, ".json");
-        const versions = listVersions(flowName);
-        const nextVersion = versions.length > 0 ? versions[versions.length - 1] + 1 : 1;
-
-        // Stamp the version number into the definition
-        flowDef.version = String(nextVersion);
-
-        const dir = versionsDir(flowName);
-        fs.mkdirSync(dir, { recursive: true });
-        const versionFile = pathMod.join(dir, `${nextVersion}.json`);
-        fs.writeFileSync(versionFile, JSON.stringify(flowDef, null, 2) + "\n");
+        const published = publishDraft(workspace, params.file);
 
         return {
           content: [
             {
               type: "text",
-              text: `Published "${flowDef.flow}" as v${nextVersion}. flow_run will now use this version by default.\nFile: ${versionFile}`,
+              text: `Published "${published.flow}" as v${published.version}. flow_run will now use this version by default.\nFile: ${published.file}`,
             },
           ],
           details: {
-            flow: flowDef.flow,
-            version: nextVersion,
-            file: versionFile,
-            totalVersions: nextVersion,
+            flow: published.flow,
+            version: published.version,
+            file: published.file,
+            totalVersions: published.totalVersions,
           },
         };
       },
