@@ -58,3 +58,12 @@ export { parseDuration, MODEL_MAP, DEFAULT_MODEL, NODE_KEYS } from "./core/types
 export { startFlowServer } from "./core/serve.js";
 export type { FlowServerOpts } from "./core/serve.js";
 export type { ServeConfig } from "./core/types.js";
+export {
+  publishDraft,
+  resolveFlowFile,
+  versionsDir,
+  listVersions,
+  readVersion,
+  readLatestVersion,
+} from "./core/manage.js";
+export type { PublishResult } from "./core/manage.js";

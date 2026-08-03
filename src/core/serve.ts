@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import type { FlowDefinition, ServeConfig } from "./types.js";
 import type { FlowRunner } from "./runner.js";
+import { validateFlow } from "./validate.js";
 
 // ---- Flow Server ----------------------------------------------------------------
 // Lightweight HTTP server that runs flows on POST. Trigger semantics (webhooks,
@@ -11,6 +12,7 @@ import type { FlowRunner } from "./runner.js";
 //
 // Endpoints:
 //   POST /:basePath/:flowName/run  — run a flow with the JSON body as inputs
+//   POST /:basePath/validate       — statically validate a flow definition
 //   GET  /:basePath/health         — health check
 
 export interface FlowServerOpts {
@@ -101,6 +103,36 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
     // Health check
     if (req.method === "GET" && pathname === `${basePath}/health`) {
       json(res, 200, { ok: true, flowsDir });
+      return;
+    }
+
+    // Validate a flow definition: POST /:basePath/validate
+    // Pure static validation against THIS process's live step registry —
+    // custom steps registered by sibling plugins (e.g. Clawnify's
+    // clawnify_app/clawnify_action) only exist in the gateway process, so this
+    // is the one place an off-box caller can get registry-correct validation.
+    // No state, no execution; safe to leave unauthenticated like /health.
+    if (req.method === "POST" && pathname === `${basePath}/validate`) {
+      try {
+        const rawBody = await readBody(req);
+        let def: unknown;
+        try {
+          def = rawBody ? JSON.parse(rawBody) : null;
+        } catch {
+          json(res, 400, { error: "Invalid JSON body" });
+          return;
+        }
+        if (!def || typeof def !== "object" || Array.isArray(def)) {
+          json(res, 400, { error: "Body must be a flow definition object" });
+          return;
+        }
+        json(res, 200, validateFlow(def as FlowDefinition));
+      } catch (err) {
+        log.error(
+          `[clawflow] validate error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        json(res, 500, { error: "Internal server error" });
+      }
       return;
     }
 
