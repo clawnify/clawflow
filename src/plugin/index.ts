@@ -103,6 +103,9 @@ function register(api: PluginApi) {
     startFlowServer({
       runner,
       serve: pluginCfg.serve,
+      // Same workspace the flow_* tools use, so a triggered run resolves the
+      // published version exactly like flow_run does.
+      workspace,
       logger: api.logger,
     });
   }
