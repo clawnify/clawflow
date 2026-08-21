@@ -570,12 +570,58 @@ flows/
   triggers, dashboard runs) resolve the same way: latest published version, draft
   only when nothing is published. So a draft edit does not change what a live
   trigger executes once the flow has been published at least once.
+- Scheduled triggers (`flow_trigger`) resolve the same way unless pinned to a
+  version — see "Scheduling a flow" below.
 - `flow_run file: "my-flow" draft: true` — explicitly run the working copy
 - `flow_run file: "my-flow" version: 2` — run a specific version
 - `flow_read file: "my-flow" version: 1` — inspect a specific published version
 - Version numbers are auto-incrementing integers (1, 2, 3...) — no semver
 - Edits to the draft never affect published versions
 - **Do NOT create separate files for versions** (e.g. `my-flow-v2.json`). Use `flow_publish` instead.
+
+## Scheduling a flow
+
+`flow_trigger` runs a flow on a cron schedule on this box. A trigger is a
+**separate record**, not a field on the flow: one flow can carry several
+triggers with different cadences and different inputs, and pausing one never
+edits the flow or mints a new version.
+
+```
+flow_trigger action: "create" flow: "daily-digest" cron: "0 9 * * *" tz: "Europe/Rome"
+flow_trigger action: "update" id: "daily-digest-ab12cd34" cron: "0 7 * * *"
+flow_trigger action: "list"
+flow_trigger action: "pause"   id: "daily-digest-ab12cd34"
+flow_trigger action: "resume"  id: "daily-digest-ab12cd34"
+flow_trigger action: "run_now" id: "daily-digest-ab12cd34"
+flow_trigger action: "delete"  id: "daily-digest-ab12cd34"
+```
+
+**Per-trigger inputs** — the same flow, two customers, two cadences:
+
+```
+flow_trigger action: "create" flow: "digest" cron: "0 * * * *" inputs: { "customer": "acme" }
+flow_trigger action: "create" flow: "digest" cron: "0 9 * * *" inputs: { "customer": "globex" }
+```
+
+**Rules:**
+- Standard 5-field cron. The minimum interval is 60 seconds — sub-minute
+  schedules are rejected, not silently accepted.
+- `tz` is an IANA name (`Europe/Rome`). Host local time when omitted.
+- A trigger runs the **latest published version** by default. Pass `version: 2`
+  to pin one — useful when you want a schedule to keep running a known-good
+  definition while the draft moves on.
+- **Missed runs are not replayed.** If the host was down at 09:00 the trigger
+  does not fire at boot; it waits for the next occurrence.
+- Runs never overlap: if the previous run is still going, the tick is skipped.
+- Soft-deleting a flow (`flow_delete`) **pauses** its triggers rather than
+  removing them, so a restore keeps them — restore then requires an explicit
+  `resume`, so nothing silently re-arms.
+- Triggers are plain records on disk, so the Clawnify dashboard reads and edits
+  the same ones you see here. A change made there is picked up by the running
+  scheduler within ~30s — no restart.
+- Arming, editing, pausing, resuming or deleting a schedule requires approval by default
+  (same gate as flow authoring) — a schedule runs a flow unattended with tool
+  access, so it is treated as a mutation.
 
 ## Reading and discovering flows
 
