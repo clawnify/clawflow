@@ -1,10 +1,9 @@
 import * as http from "http";
-import * as fs from "fs";
 import * as path from "path";
 import type { FlowDefinition, ServeConfig } from "./types.js";
 import type { FlowRunner } from "./runner.js";
 import { validateFlow } from "./validate.js";
-import { readLatestVersion } from "./manage.js";
+import { resolveRunnableFlow } from "./manage.js";
 
 // ---- Flow Server ----------------------------------------------------------------
 // Lightweight HTTP server that runs flows on POST. Trigger semantics (webhooks,
@@ -43,39 +42,6 @@ function resolveWorkspace(workspace?: string): string {
 
 function resolveFlowsDir(serve: ServeConfig, workspace: string): string {
   return serve.flowsDir ?? path.join(workspace, "flows");
-}
-
-/**
- * Resolve what an incoming trigger should execute: the latest PUBLISHED
- * version when the flow has one, else the draft.
- *
- * Same precedence as the flow_run tool — a webhook and an agent run must never
- * execute different definitions of the same flow, or "publish" means nothing
- * for every off-box caller (webhooks, HTTP triggers, the dashboard).
- * Unpublished flows still run from the draft so a flow works the moment it's
- * written.
- */
-function loadFlow(
-  workspace: string,
-  flowsDir: string,
-  flowName: string,
-): { def: FlowDefinition; source: string } | null {
-  const safe = flowName.replace(/[^a-zA-Z0-9_-]/g, "");
-  if (!safe) return null;
-
-  const latest = readLatestVersion(workspace, safe);
-  if (latest) return { def: latest.def, source: `v${latest.version}` };
-
-  const file = path.join(flowsDir, `${safe}.json`);
-  if (!fs.existsSync(file)) return null;
-  try {
-    return {
-      def: JSON.parse(fs.readFileSync(file, "utf8")) as FlowDefinition,
-      source: "draft (no published versions)",
-    };
-  } catch {
-    return null;
-  }
 }
 
 function json(
@@ -176,7 +142,7 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
     const flowName = match[1];
 
     try {
-      const loaded = loadFlow(workspace, flowsDir, flowName);
+      const loaded = resolveRunnableFlow(workspace, flowsDir, flowName);
       if (!loaded) {
         json(res, 404, { error: `Flow not found: ${flowName}` });
         return;

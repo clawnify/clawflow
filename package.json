@@ -1,6 +1,6 @@
 {
   "name": "@clawnify/clawflow",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "The n8n for agents. A declarative, AI-native workflow format that agents can read, write, and run.",
   "type": "module",
   "main": "./dist/index.js",
@@ -85,5 +85,8 @@
   "homepage": "https://github.com/clawnify/clawflow#readme",
   "bugs": {
     "url": "https://github.com/clawnify/clawflow/issues"
+  },
+  "dependencies": {
+    "croner": "^10.0.1"
   }
 }

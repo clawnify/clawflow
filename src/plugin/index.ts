@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { FlowRunner, sendEvent } from "../core/runner.js";
 
 import { startFlowServer } from "../core/serve.js";
+import { TriggerStore } from "../core/triggers.js";
+import { TriggerScheduler, assertValidSchedule } from "../core/scheduler.js";
 import { validateFlow } from "../core/validate.js";
 import {
   publishDraft,
@@ -110,6 +112,22 @@ function register(api: PluginApi) {
     });
   }
 
+  // ---- Trigger scheduler --------------------------------------------------------
+  // Fires scheduled flows on this box. Skipped for child agents alongside the
+  // flow server so a spawned agent never double-fires its parent's triggers.
+  const flowsDir = pluginCfg.serve?.flowsDir ?? path.join(workspace, "flows");
+  const triggerStore = new TriggerStore(workspace);
+  const scheduler = new TriggerScheduler({
+    runner,
+    store: triggerStore,
+    workspace,
+    flowsDir,
+    logger: api.logger,
+  });
+  if (!process.env.CLAWFLOW_NO_SERVE) {
+    scheduler.start();
+  }
+
   // ---- Approval gate for flow_run -----------------------------------------------
   // Flows can call HTTP, exec, and agent tools, so by default we prompt the user
   // before each run. Disable entirely (`approval.enabled: false`) or skip for
@@ -132,6 +150,18 @@ function register(api: PluginApi) {
   // independently of `enabled` (which governs flow_run) and does NOT honor
   // skipSessionPatterns. Kill-switch: approval.gateMutations=false.
   const gateMutations = approvalCfg.gateMutations !== false;
+  // Arming a schedule commits the box to running a flow unattended, on a timer,
+  // with tool access — at least as consequential as editing one, so it is gated
+  // the same way. Reads (list) are not gated.
+  const TRIGGER_MUTATION_VERBS: Record<string, string> = {
+    create: "Schedule",
+    update: "Reschedule",
+    delete: "Unschedule",
+    pause: "Pause schedule for",
+    resume: "Resume schedule for",
+    run_now: "Run now",
+  };
+
   const MUTATION_VERBS: Record<string, string> = {
     flow_create: "Create",
     flow_edit: "Edit",
@@ -147,14 +177,22 @@ function register(api: PluginApi) {
 
         // Flow-authoring tools — always gate (no skipSessionPatterns). No
         // allow-always persist path, so every call re-prompts.
-        const mutationVerb = toolName ? MUTATION_VERBS[toolName] : undefined;
+        // flow_trigger is action-shaped: gate the mutating actions, let reads through.
+        let mutationVerb = toolName ? MUTATION_VERBS[toolName] : undefined;
+        if (toolName === "flow_trigger") {
+          const action = (event.params as { action?: string } | undefined)?.action;
+          mutationVerb = TRIGGER_MUTATION_VERBS[action ?? ""] ?? undefined;
+        }
         if (gateMutations && mutationVerb) {
-          const mp = (event.params ?? {}) as { file?: string; flow?: string };
-          const name = mp.flow ?? mp.file ?? "inline flow";
+          const mp = (event.params ?? {}) as { file?: string; flow?: string; id?: string };
+          const name = mp.flow ?? mp.file ?? mp.id ?? "inline flow";
           return {
             requireApproval: {
               title: `${mutationVerb} clawflow "${name}"?`.slice(0, 80),
-              description: "Creates, edits, publishes, or deletes a flow definition.",
+              description:
+                toolName === "flow_trigger"
+                  ? "Changes an unattended schedule that runs a flow on a timer."
+                  : "Creates, edits, publishes, or deletes a flow definition.",
               severity: "warning",
               timeoutMs: approvalTimeoutMs,
               timeoutBehavior: approvalTimeoutBehavior,
@@ -418,11 +456,19 @@ Safe for agents to call without fear of data loss.`,
 
         fs.renameSync(abs, binPath);
 
+        // Schedules outlive a soft delete, but must not keep firing at a flow
+        // that is no longer there. Paused, not removed, so a restore keeps them.
+        const pausedIds = triggerStore.pauseForFlow(path.basename(abs, ".json"));
+        const pausedNote =
+          pausedIds.length > 0
+            ? `\nPaused ${pausedIds.length} trigger(s) for this flow: ${pausedIds.join(", ")}`
+            : "";
+
         return {
           content: [
             {
               type: "text",
-              text: `Flow moved to bin: ${binPath}`,
+              text: `Flow moved to bin: ${binPath}${pausedNote}`,
             },
           ],
         };
@@ -1937,6 +1983,212 @@ re-send the whole flow: a single large edit is slow and can stall mid-generation
         }
 
         return fail(`Unknown action: "${params.action}"`);
+      },
+    },
+    { optional: true },
+  );
+
+  // ---- flow_trigger -------------------------------------------------------------
+
+  api.registerTool(
+    {
+      name: "flow_trigger",
+      description: `Schedule a flow to run on a recurring cron schedule on this box.
+
+A trigger is a separate record, not a field on the flow — so one flow can have
+several triggers with different cadences and different inputs, and pausing one
+never touches the flow definition or mints a new version.
+
+Actions:
+  create   — arm a new schedule (flow + cron required)
+  update   — edit an existing schedule (cron, tz, inputs, version, description)
+  list     — list triggers, optionally filtered by flow
+  pause    — stop firing, keep the record
+  resume   — start firing again
+  delete   — remove the record
+  run_now  — fire immediately, ignoring the schedule
+
+Schedules are standard 5-field cron ("0 9 * * *"). Minimum interval is 60s.
+Runs missed while the host was down are NOT replayed.
+By default a trigger runs the latest PUBLISHED version; pin one with "version".`,
+
+      parameters: {
+        type: "object",
+        required: ["action"],
+        properties: {
+          action: {
+            type: "string",
+            enum: ["create", "update", "list", "pause", "resume", "delete", "run_now"],
+          },
+          id: {
+            type: "string",
+            description: "Trigger id. Required for update/pause/resume/delete/run_now.",
+          },
+          flow: {
+            type: "string",
+            description: "Flow name. Required for create; optional filter for list.",
+          },
+          cron: {
+            type: "string",
+            description:
+              'Cron expression, e.g. "0 9 * * *". Required for create; optional for update.',
+          },
+          tz: {
+            type: "string",
+            description: 'IANA timezone, e.g. "Europe/Rome". Host local time when omitted.',
+          },
+          inputs: {
+            type: "object",
+            additionalProperties: true,
+            description: "Payload passed as the flow's inputs on every fire.",
+          },
+          version: {
+            type: "number",
+            description: "Pin a published version. Omit to always run the latest published.",
+          },
+          description: { type: "string" },
+        },
+      },
+
+      async execute(
+        _id: string,
+        params: {
+          action: string;
+          id?: string;
+          flow?: string;
+          cron?: string;
+          tz?: string;
+          inputs?: Record<string, unknown>;
+          version?: number;
+          description?: string;
+        },
+      ) {
+        const text = (t: string) => ({ content: [{ type: "text", text: t }] });
+
+        const requireId = (): string => {
+          if (!params.id) throw new Error(`"id" is required for action "${params.action}"`);
+          if (!triggerStore.get(params.id)) throw new Error(`Trigger not found: ${params.id}`);
+          return params.id;
+        };
+
+        const describe = (r: {
+          id: string;
+          flowName: string;
+          cron: string;
+          tz?: string;
+          version: number | "@published";
+          enabled: boolean;
+          nextRunAt?: string;
+          lastRunAt?: string;
+          lastStatus?: string;
+        }) =>
+          `${r.enabled ? "●" : "○"} ${r.id}\n` +
+          `    flow: ${r.flowName} (${r.version === "@published" ? "latest published" : `v${r.version}`})\n` +
+          `    cron: ${r.cron}${r.tz ? ` [${r.tz}]` : ""}\n` +
+          `    next: ${r.enabled ? (r.nextRunAt ?? "—") : "paused"}` +
+          (r.lastRunAt ? `\n    last: ${r.lastRunAt} (${r.lastStatus ?? "?"})` : "");
+
+        try {
+          switch (params.action) {
+            case "create": {
+              if (!params.flow) throw new Error('"flow" is required for action "create"');
+              if (!params.cron) throw new Error('"cron" is required for action "create"');
+              // Validate before storing: a bad schedule must fail here, not at
+              // fire time on a box nobody is watching.
+              assertValidSchedule(params.cron, params.tz);
+              const record = triggerStore.create({
+                flowName: params.flow,
+                cron: params.cron,
+                tz: params.tz,
+                inputs: params.inputs,
+                version: params.version,
+                description: params.description,
+              });
+              scheduler.sync();
+              const stored = triggerStore.get(record.id) ?? record;
+              return text(`Scheduled.\n\n${describe(stored)}`);
+            }
+
+            case "update": {
+              const id = requireId();
+              const current = triggerStore.get(id)!;
+              const cron = params.cron ?? current.cron;
+              const tz = params.tz ?? current.tz;
+              // Re-validate the resulting schedule, not just the field that
+              // changed — a new tz can invalidate an expression that was fine.
+              assertValidSchedule(cron, tz);
+              triggerStore.update(id, {
+                cron,
+                ...(params.tz !== undefined ? { tz: params.tz } : {}),
+                ...(params.inputs !== undefined ? { inputs: params.inputs } : {}),
+                ...(params.version !== undefined ? { version: params.version } : {}),
+                ...(params.description !== undefined
+                  ? { description: params.description }
+                  : {}),
+              });
+              scheduler.sync();
+              return text(`Updated.\n\n${describe(triggerStore.get(id)!)}`);
+            }
+
+            case "list": {
+              const records = triggerStore.list(
+                params.flow ? { flowName: params.flow } : undefined,
+              );
+              if (records.length === 0) {
+                return text(
+                  params.flow
+                    ? `No triggers for flow "${params.flow}".`
+                    : "No triggers on this box.",
+                );
+              }
+              return text(records.map(describe).join("\n\n"));
+            }
+
+            case "pause": {
+              const id = requireId();
+              triggerStore.update(id, { enabled: false, nextRunAt: undefined });
+              scheduler.sync();
+              return text(`Paused ${id}. The flow definition is unchanged.`);
+            }
+
+            case "resume": {
+              const id = requireId();
+              triggerStore.update(id, { enabled: true });
+              scheduler.sync();
+              return text(`Resumed.\n\n${describe(triggerStore.get(id)!)}`);
+            }
+
+            case "delete": {
+              const id = requireId();
+              triggerStore.remove(id);
+              scheduler.sync();
+              return text(`Deleted trigger ${id}.`);
+            }
+
+            case "run_now": {
+              const id = requireId();
+              const result = await scheduler.runNow(id);
+              if (!result) {
+                const stored = triggerStore.get(id);
+                return text(
+                  `Trigger ${id} did not run: ${stored?.lastError ?? "flow could not be resolved"}`,
+                );
+              }
+              return text(
+                `Ran ${id} → instance ${result.instanceId} (${result.status}).`,
+              );
+            }
+
+            default:
+              return text(`Unknown action: "${params.action}"`);
+          }
+        } catch (err) {
+          return text(
+            `flow_trigger ${params.action} failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
       },
     },
     { optional: true },

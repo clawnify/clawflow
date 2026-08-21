@@ -87,3 +87,58 @@ describe("clawflow approval gate — flow mutation tools", () => {
     assert.equal(await hook({ toolName: "flow_read", params: { file: "f" } }), undefined);
   });
 });
+
+describe("clawflow approval gate — flow_trigger", () => {
+  it("gates the mutating actions", async () => {
+    const hook = captureHook({});
+    for (const [action, verb] of [
+      ["create", "Schedule"],
+      ["update", "Reschedule"],
+      ["delete", "Unschedule"],
+      ["pause", "Pause schedule for"],
+      ["resume", "Resume schedule for"],
+      ["run_now", "Run now"],
+    ] as const) {
+      const res = await hook({
+        toolName: "flow_trigger",
+        params: { action, flow: "my-flow" },
+      });
+      assert.ok(res && res.requireApproval, `flow_trigger ${action} should require approval`);
+      assert.match(res.requireApproval!.title, new RegExp(`^${verb} clawflow "my-flow"`));
+      assert.match(res.requireApproval!.description, /unattended schedule/);
+    }
+  });
+
+  it("does not gate list", async () => {
+    const hook = captureHook({});
+    const res = await hook({ toolName: "flow_trigger", params: { action: "list" } });
+    assert.ok(!res || !res.requireApproval, "listing triggers is a read, not a mutation");
+  });
+
+  it("names the trigger id when there is no flow name in params", async () => {
+    const hook = captureHook({});
+    const res = await hook({
+      toolName: "flow_trigger",
+      params: { action: "pause", id: "digest-ab12cd34" },
+    });
+    assert.match(res!.requireApproval!.title, /"digest-ab12cd34"/);
+  });
+
+  it("gates trigger mutations even when the flow_run gate is disabled", async () => {
+    const hook = captureHook({ approval: { enabled: false } });
+    const res = await hook({
+      toolName: "flow_trigger",
+      params: { action: "create", flow: "x" },
+    });
+    assert.ok(res && res.requireApproval, "arming a schedule must still gate");
+  });
+
+  it("respects the gateMutations kill-switch", async () => {
+    const hook = captureHook({ approval: { gateMutations: false } });
+    const res = await hook({
+      toolName: "flow_trigger",
+      params: { action: "create", flow: "x" },
+    });
+    assert.ok(!res || !res.requireApproval);
+  });
+});
