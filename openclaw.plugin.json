@@ -129,7 +129,7 @@
           "gateMutations": {
             "type": "boolean",
             "default": true,
-            "description": "Gate flow authoring/publishing (flow_create/edit/publish/delete) behind approval on every call, independently of `enabled` (which governs flow_run). Set false to disable."
+            "description": "Retired in 1.5.2 and ignored: flow authoring (flow_create/edit/publish/delete) is gated by @clawnify/agent-permissions, the box's permission authority. Kept so existing configs still validate."
           }
         }
       }

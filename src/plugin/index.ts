@@ -127,42 +127,22 @@ function register(api: PluginApi) {
       : 5 * 60_000;
   const approvalTimeoutBehavior: "allow" | "deny" =
     approvalCfg.timeoutBehavior === "allow" ? "allow" : "deny";
-  // Intrinsic mutation gate: authoring/publishing/deleting a flow is a write
-  // action that must never run without a human OK, so it is gated on every call
-  // independently of `enabled` (which governs flow_run) and does NOT honor
-  // skipSessionPatterns. Kill-switch: approval.gateMutations=false.
-  const gateMutations = approvalCfg.gateMutations !== false;
-  const MUTATION_VERBS: Record<string, string> = {
-    flow_create: "Create",
-    flow_edit: "Edit",
-    flow_publish: "Publish",
-    flow_delete: "Delete",
-  };
+  // Flow authoring (flow_create / flow_edit / flow_publish / flow_delete) is
+  // gated by @clawnify/agent-permissions ≥ 0.6.0, the one permission authority
+  // on the box, not here. This plugin's own gate for it (1.3 – 1.5.1) was
+  // registered through registerHook, which OpenClaw 2026.9.1 no longer
+  // dispatches for before_tool_call, so it would have prompted on 2026.7.1 and
+  // silently not on 2026.9.1; and with both gates live a 2026.7.1 box prompted
+  // twice per write. `approval.gateMutations` is accepted for old configs and
+  // ignored. Only the flow_run gate stays here: it is the operator's opt-in,
+  // skippable for unattended sessions.
 
-  if (api.registerHook && (approvalEnabled || gateMutations)) {
+  if (api.registerHook && approvalEnabled) {
     api.registerHook(
       "before_tool_call",
       (event) => {
         const toolName = event.toolName ?? event.tool;
-
-        // Flow-authoring tools — always gate (no skipSessionPatterns). No
-        // allow-always persist path, so every call re-prompts.
-        const mutationVerb = toolName ? MUTATION_VERBS[toolName] : undefined;
-        if (gateMutations && mutationVerb) {
-          const mp = (event.params ?? {}) as { file?: string; flow?: string };
-          const name = mp.flow ?? mp.file ?? "inline flow";
-          return {
-            requireApproval: {
-              title: `${mutationVerb} clawflow "${name}"?`.slice(0, 80),
-              description: "Creates, edits, publishes, or deletes a flow definition.",
-              severity: "warning",
-              timeoutMs: approvalTimeoutMs,
-              timeoutBehavior: approvalTimeoutBehavior,
-            },
-          };
-        }
-
-        if (!approvalEnabled || toolName !== "flow_run") return;
+        if (toolName !== "flow_run") return;
 
         const sessionKey = event.context?.sessionKey ?? "";
         if (skipPatterns.some((pattern) => sessionKey.includes(pattern))) {
@@ -185,7 +165,7 @@ function register(api: PluginApi) {
       },
       {
         name: "clawflow-approval-gate",
-        description: "Gate flow_run (skippable) and flow authoring/publishing/deletion (always) behind user approval.",
+        description: "Gate flow_run behind user approval (skippable for unattended sessions). Flow authoring is gated by agent-permissions.",
       },
     );
   } else if (!api.registerHook) {
