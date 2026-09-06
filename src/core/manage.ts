@@ -119,3 +119,46 @@ export function publishDraft(workspace: string, file: string): PublishResult {
     totalVersions: nextVersion,
   };
 }
+
+/**
+ * Resolve what an incoming trigger should execute: a pinned version when one is
+ * requested, else the latest PUBLISHED version, else the draft.
+ *
+ * This is the one place that answers "which definition does a trigger run".
+ * The flow server, the scheduler, and any off-box caller share it so a webhook,
+ * a cron trigger, and an agent run can never execute different definitions of
+ * the same flow — the invariant 1.5.1 established.
+ *
+ * Returns null when the flow (or the pinned version) does not exist.
+ */
+export function resolveRunnableFlow(
+  workspace: string,
+  flowsDir: string,
+  flowName: string,
+  version?: number | "@published",
+): { def: FlowDefinition; version: number | null; source: string } | null {
+  const safe = flowName.replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!safe) return null;
+
+  if (typeof version === "number") {
+    const def = readVersion(workspace, safe, version);
+    return def ? { def, version, source: `v${version}` } : null;
+  }
+
+  const latest = readLatestVersion(workspace, safe);
+  if (latest) {
+    return { def: latest.def, version: latest.version, source: `v${latest.version}` };
+  }
+
+  const file = path.join(flowsDir, `${safe}.json`);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return {
+      def: JSON.parse(fs.readFileSync(file, "utf8")) as FlowDefinition,
+      version: null,
+      source: "draft (no published versions)",
+    };
+  } catch {
+    return null;
+  }
+}

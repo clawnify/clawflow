@@ -56,6 +56,10 @@ export type {
 } from "./core/types.js";
 export { parseDuration, MODEL_MAP, DEFAULT_MODEL, NODE_KEYS } from "./core/types.js";
 export { startFlowServer } from "./core/serve.js";
+export { TriggerStore } from "./core/triggers.js";
+export type { TriggerRecord, CreateTriggerInput } from "./core/triggers.js";
+export { TriggerScheduler, assertValidSchedule } from "./core/scheduler.js";
+export type { TriggerSchedulerOpts } from "./core/scheduler.js";
 export type { FlowServerOpts } from "./core/serve.js";
 export type { ServeConfig } from "./core/types.js";
 export {
@@ -65,5 +69,6 @@ export {
   listVersions,
   readVersion,
   readLatestVersion,
+  resolveRunnableFlow,
 } from "./core/manage.js";
 export type { PublishResult } from "./core/manage.js";

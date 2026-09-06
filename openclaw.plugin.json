@@ -1,8 +1,8 @@
 {
   "id": "clawflow",
   "name": "ClawFlow",
-  "description": "The n8n for agents. Declarative, AI-native workflow engine — LLM-writable, Cloudflare-portable.",
-  "version": "1.4.1",
+  "description": "The n8n for agents. Declarative, AI-native workflow engine \u2014 LLM-writable, Cloudflare-portable.",
+  "version": "1.6.0",
   "skills": [
     "./skills/clawflow"
   ],
@@ -21,7 +21,8 @@
       "flow_list",
       "flow_read",
       "flow_publish",
-      "flow_edit"
+      "flow_edit",
+      "flow_trigger"
     ]
   },
   "configSchema": {
@@ -129,7 +130,7 @@
           "gateMutations": {
             "type": "boolean",
             "default": true,
-            "description": "Retired in 1.5.2 and ignored: flow authoring (flow_create/edit/publish/delete) is gated by @clawnify/agent-permissions, the box's permission authority. Kept so existing configs still validate."
+            "description": "Retired in 1.6.1 and ignored: flow authoring (flow_create/edit/publish/delete) and schedule changes (flow_trigger) are gated by @clawnify/agent-permissions, the box's permission authority. Kept so existing configs still validate."
           }
         }
       }

@@ -81,3 +81,18 @@ describe("clawflow approval gate", () => {
     assert.equal(await hook({ toolName: "flow_read", params: { file: "f" } }), undefined);
   });
 });
+
+describe("clawflow approval gate — flow_trigger is the authority's too", () => {
+  // Schedules commit the box to running a flow unattended; since 1.6.1 the
+  // authority (@clawnify/agent-permissions ≥ 0.6.0) asks for every mutating
+  // action and lets list through. Nothing is gated here any more.
+  it("does not gate any action, whatever the config says", async () => {
+    for (const approval of [{ enabled: true }, { enabled: true, gateMutations: true }]) {
+      const hook = captureHook({ approval });
+      for (const action of ["create", "update", "delete", "pause", "resume", "run_now", "list"]) {
+        const res = await hook({ toolName: "flow_trigger", params: { action, id: "trg_1" } });
+        assert.equal(res, undefined, `flow_trigger ${action} must be left to agent-permissions`);
+      }
+    }
+  });
+});

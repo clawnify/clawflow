@@ -65,6 +65,7 @@ Workflows today are written **for** agents, not **by** them. Visual canvas tools
 - **Approval gates** — `do: wait` pauses for human review, resumes with a token
 - **External events** — `waitForEvent` blocks until an external system pushes data
 - **Per-node retry** — exponential, linear, or constant backoff on any node
+- **Scheduled triggers** — cron schedules as first-class records: many per flow, each with its own inputs, paused without touching the flow
 
 ### Portability
 - **OpenClaw plugin** — run flows as agent tools today
@@ -478,8 +479,60 @@ Any string field supports `{{ path.to.value }}` interpolation resolved against f
 **Important:** templates reference the **`output` key**, not the node name. If a node has `"name": "get_data", "output": "api"`, reference it as `{{ api }}` — not `{{ get_data }}`.
 
 Flow state starts as `{ inputs: <payload> }` and grows as nodes complete. The
-caller (CLI, webhook server, parent flow, dashboard) is responsible for
-producing that payload — the flow itself is trigger-agnostic.
+caller (CLI, webhook server, scheduled trigger, parent flow, dashboard) is
+responsible for producing that payload — the flow definition itself stays
+trigger-agnostic. Schedules live in their own records, not in the flow (see
+[Scheduling](#scheduling)).
+
+---
+
+## Scheduling
+
+A flow runs when something invokes it: an agent, an HTTP call, or a **trigger**.
+
+A trigger is a first-class record — not a field on the flow definition:
+
+```bash
+flow_trigger action: "create" flow: "daily-digest" cron: "0 9 * * *" tz: "Europe/Rome"
+```
+
+```
+● daily-digest-ab12cd34
+    flow: daily-digest (latest published)
+    cron: 0 9 * * * [Europe/Rome]
+    next: 2026-08-22T07:00:00.000Z
+```
+
+That separation is deliberate. A schedule is mutable operational state — paused
+at 2am, retimed, pointed at a different version — while a published flow version
+is an immutable artifact. Embedding one in the other would make "pause" mean
+"publish a new version", and would let an unrelated publish silently re-arm a
+schedule the draft happened to carry. Temporal made the same move from
+cron-in-workflow to a separate Schedules object, for the same reason.
+
+Because triggers are their own records, one flow can have many, each with its
+own payload:
+
+```bash
+flow_trigger action: "create" flow: "digest" cron: "0 * * * *" inputs: '{"customer":"acme"}'
+flow_trigger action: "create" flow: "digest" cron: "0 9 * * *" inputs: '{"customer":"globex"}'
+```
+
+| Behavior | Rule |
+|---|---|
+| Expression | Standard 5-field cron; minimum interval 60s |
+| Timezone | IANA name (`Europe/Rome`); host local time when omitted |
+| Version | Latest published by default; pin with `version: 2` |
+| Missed runs | **Not replayed** — a host that was down at 09:00 waits for the next occurrence |
+| Overlap | A tick is skipped if the previous run is still going |
+| Flow deleted | Triggers are **paused**, not removed, so a restore keeps them |
+| Approval | Arming/pausing/deleting a schedule is gated like flow authoring |
+
+Records live in `.clawflow/triggers/<id>.json`, alongside `.clawflow/versions/`.
+Out-of-process callers — the Clawnify hook server and dashboard — read and write
+them by importing `TriggerStore` from `dist`, the same way they read published
+versions. The running scheduler re-reads the directory every 30s, so a schedule
+created or edited in the dashboard goes live without a restart.
 
 ---
 
@@ -542,6 +595,7 @@ Eleven tools registered in OpenClaw:
 | `flow_read` | Read a flow definition (draft or specific version), inspect single nodes |
 | `flow_publish` | Publish current draft as a new numbered version |
 | `flow_edit` | Edit nodes in a flow definition (set, update, add, remove, move, wrap, revert, list) |
+| `flow_trigger` | Schedule a flow on cron (create, update, list, pause, resume, delete, run_now) |
 
 **Config:**
 ```json
@@ -557,7 +611,7 @@ Eleven tools registered in OpenClaw:
   "agents": {
     "list": [{
       "id": "main",
-      "tools": { "alsoAllow": ["flow_create", "flow_delete", "flow_restore_from_bin", "flow_run", "flow_resume", "flow_send_event", "flow_status", "flow_list", "flow_read", "flow_publish", "flow_edit"] }
+      "tools": { "alsoAllow": ["flow_create", "flow_delete", "flow_restore_from_bin", "flow_run", "flow_resume", "flow_send_event", "flow_status", "flow_list", "flow_read", "flow_publish", "flow_edit", "flow_trigger"] }
     }]
   }
 }
