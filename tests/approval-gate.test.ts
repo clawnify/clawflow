@@ -36,41 +36,35 @@ function captureHook(clawflowConfig: Record<string, unknown>): Hook {
   return hook!;
 }
 
-describe("clawflow approval gate — flow mutation tools", () => {
-  it("gates create/edit/publish/delete by default", async () => {
-    const hook = captureHook({});
-    for (const [tool, verb] of [
-      ["flow_create", "Create"],
-      ["flow_edit", "Edit"],
-      ["flow_publish", "Publish"],
-      ["flow_delete", "Delete"],
-    ] as const) {
-      const res = await hook({ toolName: tool, params: { flow: "my-flow" } });
-      assert.ok(res && res.requireApproval, `${tool} should require approval`);
-      assert.match(res.requireApproval!.title, new RegExp(`^${verb} clawflow "my-flow"`));
+describe("clawflow approval gate", () => {
+  // Since 1.5.2 flow_create/edit/publish/delete are gated by
+  // @clawnify/agent-permissions (always-ask, no rule can pre-approve). This
+  // plugin must not gate them too: OpenClaw 2026.9.1 stopped dispatching
+  // registerHook for before_tool_call, so a gate here prompts on 2026.7.1 and
+  // silently does not on 2026.9.1, and with both live a 2026.7.1 box prompts
+  // twice per write.
+  it("does not gate create/edit/publish/delete, whatever the config says", async () => {
+    for (const approval of [{ enabled: true }, { enabled: true, gateMutations: true }, { enabled: true, skipSessionPatterns: ["email"] }]) {
+      const hook = captureHook({ approval });
+      for (const tool of ["flow_create", "flow_edit", "flow_publish", "flow_delete"]) {
+        const res = await hook({ toolName: tool, params: { flow: "my-flow" } });
+        assert.equal(res, undefined, `${tool} must be left to agent-permissions`);
+      }
     }
   });
 
-  it("gates mutations even when the flow_run gate is disabled (independent of enabled)", async () => {
-    const hook = captureHook({ approval: { enabled: false } });
-    const res = await hook({ toolName: "flow_delete", params: { file: "x" } });
-    assert.ok(res && res.requireApproval, "mutation must still gate when enabled=false");
-  });
-
-  it("does NOT honor skipSessionPatterns for mutations (always require)", async () => {
-    const hook = captureHook({ approval: { skipSessionPatterns: ["email"] } });
-    const res = await hook({
-      toolName: "flow_publish",
-      params: { flow: "f" },
-      context: { sessionKey: "agent:main:main:email:123" },
-    });
-    assert.ok(res && res.requireApproval, "mutation must gate even in a skipped session");
-  });
-
-  it("kill-switch: gateMutations=false disables mutation gating", async () => {
-    const hook = captureHook({ approval: { gateMutations: false } });
-    const res = await hook({ toolName: "flow_create", params: { flow: "f" } });
-    assert.equal(res, undefined, "gateMutations=false should not gate");
+  it("registers no hook at all when the flow_run gate is off", () => {
+    let registered = false;
+    const api = {
+      registerTool: () => {},
+      registerHook: () => {
+        registered = true;
+      },
+      config: { workspace: os.tmpdir(), plugins: { entries: { clawflow: { config: { approval: { enabled: false } } } } } },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    };
+    plugin.register(api as never);
+    assert.equal(registered, false, "nothing to gate here when flow_run gating is off");
   });
 
   it("keeps flow_run behavior: gated when enabled, skipped by pattern", async () => {
@@ -88,57 +82,17 @@ describe("clawflow approval gate — flow mutation tools", () => {
   });
 });
 
-describe("clawflow approval gate — flow_trigger", () => {
-  it("gates the mutating actions", async () => {
-    const hook = captureHook({});
-    for (const [action, verb] of [
-      ["create", "Schedule"],
-      ["update", "Reschedule"],
-      ["delete", "Unschedule"],
-      ["pause", "Pause schedule for"],
-      ["resume", "Resume schedule for"],
-      ["run_now", "Run now"],
-    ] as const) {
-      const res = await hook({
-        toolName: "flow_trigger",
-        params: { action, flow: "my-flow" },
-      });
-      assert.ok(res && res.requireApproval, `flow_trigger ${action} should require approval`);
-      assert.match(res.requireApproval!.title, new RegExp(`^${verb} clawflow "my-flow"`));
-      assert.match(res.requireApproval!.description, /unattended schedule/);
+describe("clawflow approval gate — flow_trigger is the authority's too", () => {
+  // Schedules commit the box to running a flow unattended; since 1.6.1 the
+  // authority (@clawnify/agent-permissions ≥ 0.6.0) asks for every mutating
+  // action and lets list through. Nothing is gated here any more.
+  it("does not gate any action, whatever the config says", async () => {
+    for (const approval of [{ enabled: true }, { enabled: true, gateMutations: true }]) {
+      const hook = captureHook({ approval });
+      for (const action of ["create", "update", "delete", "pause", "resume", "run_now", "list"]) {
+        const res = await hook({ toolName: "flow_trigger", params: { action, id: "trg_1" } });
+        assert.equal(res, undefined, `flow_trigger ${action} must be left to agent-permissions`);
+      }
     }
-  });
-
-  it("does not gate list", async () => {
-    const hook = captureHook({});
-    const res = await hook({ toolName: "flow_trigger", params: { action: "list" } });
-    assert.ok(!res || !res.requireApproval, "listing triggers is a read, not a mutation");
-  });
-
-  it("names the trigger id when there is no flow name in params", async () => {
-    const hook = captureHook({});
-    const res = await hook({
-      toolName: "flow_trigger",
-      params: { action: "pause", id: "digest-ab12cd34" },
-    });
-    assert.match(res!.requireApproval!.title, /"digest-ab12cd34"/);
-  });
-
-  it("gates trigger mutations even when the flow_run gate is disabled", async () => {
-    const hook = captureHook({ approval: { enabled: false } });
-    const res = await hook({
-      toolName: "flow_trigger",
-      params: { action: "create", flow: "x" },
-    });
-    assert.ok(res && res.requireApproval, "arming a schedule must still gate");
-  });
-
-  it("respects the gateMutations kill-switch", async () => {
-    const hook = captureHook({ approval: { gateMutations: false } });
-    const res = await hook({
-      toolName: "flow_trigger",
-      params: { action: "create", flow: "x" },
-    });
-    assert.ok(!res || !res.requireApproval);
   });
 });

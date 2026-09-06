@@ -145,62 +145,23 @@ function register(api: PluginApi) {
       : 5 * 60_000;
   const approvalTimeoutBehavior: "allow" | "deny" =
     approvalCfg.timeoutBehavior === "allow" ? "allow" : "deny";
-  // Intrinsic mutation gate: authoring/publishing/deleting a flow is a write
-  // action that must never run without a human OK, so it is gated on every call
-  // independently of `enabled` (which governs flow_run) and does NOT honor
-  // skipSessionPatterns. Kill-switch: approval.gateMutations=false.
-  const gateMutations = approvalCfg.gateMutations !== false;
-  // Arming a schedule commits the box to running a flow unattended, on a timer,
-  // with tool access — at least as consequential as editing one, so it is gated
-  // the same way. Reads (list) are not gated.
-  const TRIGGER_MUTATION_VERBS: Record<string, string> = {
-    create: "Schedule",
-    update: "Reschedule",
-    delete: "Unschedule",
-    pause: "Pause schedule for",
-    resume: "Resume schedule for",
-    run_now: "Run now",
-  };
+  // Flow authoring (flow_create / flow_edit / flow_publish / flow_delete) and
+  // schedule changes (flow_trigger create / update / delete / pause / resume /
+  // run_now) are gated by @clawnify/agent-permissions ≥ 0.6.0, the one
+  // permission authority on the box, not here. This plugin's own gate for them
+  // (1.3 – 1.6.0) was registered through registerHook, which OpenClaw 2026.9.1
+  // no longer dispatches for before_tool_call, so it prompted on 2026.7.1 and
+  // silently not on 2026.9.1; and with both gates live a 2026.7.1 box prompted
+  // twice per write. `approval.gateMutations` is accepted for old configs and
+  // ignored. Only the flow_run gate stays here: it is the operator's opt-in,
+  // skippable for unattended sessions.
 
-  const MUTATION_VERBS: Record<string, string> = {
-    flow_create: "Create",
-    flow_edit: "Edit",
-    flow_publish: "Publish",
-    flow_delete: "Delete",
-  };
-
-  if (api.registerHook && (approvalEnabled || gateMutations)) {
+  if (api.registerHook && approvalEnabled) {
     api.registerHook(
       "before_tool_call",
       (event) => {
         const toolName = event.toolName ?? event.tool;
-
-        // Flow-authoring tools — always gate (no skipSessionPatterns). No
-        // allow-always persist path, so every call re-prompts.
-        // flow_trigger is action-shaped: gate the mutating actions, let reads through.
-        let mutationVerb = toolName ? MUTATION_VERBS[toolName] : undefined;
-        if (toolName === "flow_trigger") {
-          const action = (event.params as { action?: string } | undefined)?.action;
-          mutationVerb = TRIGGER_MUTATION_VERBS[action ?? ""] ?? undefined;
-        }
-        if (gateMutations && mutationVerb) {
-          const mp = (event.params ?? {}) as { file?: string; flow?: string; id?: string };
-          const name = mp.flow ?? mp.file ?? mp.id ?? "inline flow";
-          return {
-            requireApproval: {
-              title: `${mutationVerb} clawflow "${name}"?`.slice(0, 80),
-              description:
-                toolName === "flow_trigger"
-                  ? "Changes an unattended schedule that runs a flow on a timer."
-                  : "Creates, edits, publishes, or deletes a flow definition.",
-              severity: "warning",
-              timeoutMs: approvalTimeoutMs,
-              timeoutBehavior: approvalTimeoutBehavior,
-            },
-          };
-        }
-
-        if (!approvalEnabled || toolName !== "flow_run") return;
+        if (toolName !== "flow_run") return;
 
         const sessionKey = event.context?.sessionKey ?? "";
         if (skipPatterns.some((pattern) => sessionKey.includes(pattern))) {
@@ -223,7 +184,7 @@ function register(api: PluginApi) {
       },
       {
         name: "clawflow-approval-gate",
-        description: "Gate flow_run (skippable) and flow authoring/publishing/deletion (always) behind user approval.",
+        description: "Gate flow_run behind user approval (skippable for unattended sessions). Flow authoring and schedules are gated by agent-permissions.",
       },
     );
   } else if (!api.registerHook) {
