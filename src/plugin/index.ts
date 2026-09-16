@@ -30,6 +30,32 @@ export function activeTriggerScheduler(): TriggerScheduler | null {
   return activeScheduler;
 }
 
+/**
+ * Whether this process should own the box's scheduler and flow server.
+ *
+ * OpenClaw loads plugins in every process that touches config: the gateway,
+ * but also `openclaw --help`, `openclaw cron list`, plugin discovery, setup.
+ * Before this guard each of those armed a scheduler and tried to bind the
+ * flow port. A CLI that exits took its timers with it; one that hung (a
+ * diagnostic `openclaw --help` left running for 13 days on a customer box)
+ * became a second scheduler for the same trigger records and squatted on
+ * 18793 with stale code, which the real gateway then silently yielded to.
+ *
+ * Two signals, both from the host: `api.registrationMode` is "full" only
+ * when the host wants a complete registration (discovery / cli-metadata /
+ * setup-only loads never should serve), and the gateway process is the one
+ * started as `openclaw gateway run`. CLAWFLOW_SERVE=1 forces it on for
+ * tests and unusual hosts; CLAWFLOW_NO_SERVE keeps its meaning for spawned
+ * child agents and operator CLIs.
+ */
+export function shouldServe(api: { registrationMode?: string }, argv: readonly string[] = process.argv, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.CLAWFLOW_NO_SERVE) return false;
+  if (env.CLAWFLOW_SERVE === "1") return true;
+  if (api.registrationMode && api.registrationMode !== "full") return false;
+  const args = argv.slice(2);
+  return args.includes("gateway") && (args.includes("run") || args.length === 1);
+}
+
 // ---- OpenClaw Plugin: clawflow ---------------------------------------------------
 // Registers eleven tools:
 //
@@ -125,7 +151,11 @@ function register(api: PluginApi) {
     flowsDir,
     logger: api.logger,
   });
-  if (!process.env.CLAWFLOW_NO_SERVE) {
+  const serving = shouldServe(api as { registrationMode?: string });
+  api.logger?.info(
+    `clawflow: registrationMode=${(api as { registrationMode?: string }).registrationMode ?? "unknown"} argv=${process.argv.slice(2, 4).join(" ") || "-"} → ${serving ? "serving (scheduler + flow server)" : "not serving (not the gateway)"}`,
+  );
+  if (serving) {
     activeScheduler?.stop();
     activeScheduler = scheduler;
     activeTriggerStore = triggerStore;
@@ -133,10 +163,10 @@ function register(api: PluginApi) {
   }
 
   // ---- Flow server (optional) ---------------------------------------------------
-  // Skip when spawned as a child agent (CLAWFLOW_NO_SERVE) to avoid port conflicts.
-  // Started after the scheduler so its trigger routes can reach it; the
-  // accessor keeps them on the currently armed scheduler across reloads.
-  if (pluginCfg.serve && !process.env.CLAWFLOW_NO_SERVE) {
+  // Only the gateway process serves (see shouldServe). Started after the
+  // scheduler so its trigger routes can reach it; the accessor keeps them on
+  // the currently armed scheduler across reloads.
+  if (pluginCfg.serve && serving) {
     startFlowServer({
       runner,
       serve: pluginCfg.serve,

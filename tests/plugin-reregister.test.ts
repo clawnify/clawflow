@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
+process.env.CLAWFLOW_SERVE = "1"; // the test process is not `openclaw gateway run`
 import plugin, { activeTriggerScheduler } from "../src/plugin/index.js";
 import type { FlowDefinition } from "../src/index.js";
 
