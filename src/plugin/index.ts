@@ -16,6 +16,19 @@ import {
 } from "../core/manage.js";
 import type { FlowDefinition, FlowNode, PluginConfig, BranchNode, ConditionNode, LoopNode, ParallelNode } from "../core/types.js";
 
+// OpenClaw calls register() more than once per gateway process (every config
+// or agent reload), and each call used to arm a fresh TriggerScheduler without
+// stopping the previous one — so every cron trigger fired once per
+// registration (4× on a box that had reloaded 4 times). Keep the live
+// scheduler at module scope, like the flow server's activeServer, and retire
+// it before arming its replacement.
+let activeScheduler: TriggerScheduler | null = null;
+
+/** The scheduler currently armed in this process (tests + diagnostics). */
+export function activeTriggerScheduler(): TriggerScheduler | null {
+  return activeScheduler;
+}
+
 // ---- OpenClaw Plugin: clawflow ---------------------------------------------------
 // Registers eleven tools:
 //
@@ -125,6 +138,8 @@ function register(api: PluginApi) {
     logger: api.logger,
   });
   if (!process.env.CLAWFLOW_NO_SERVE) {
+    activeScheduler?.stop();
+    activeScheduler = scheduler;
     scheduler.start();
   }
 
