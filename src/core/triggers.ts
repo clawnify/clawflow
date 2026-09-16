@@ -34,6 +34,8 @@ export interface TriggerRecord {
   lastInstanceId?: string;
   /** Informational: when the scheduler expects to fire next. */
   nextRunAt?: string;
+  /** Who created it: the agent (flow_trigger tool) or a person (dashboard). */
+  origin?: "agent" | "dashboard";
 }
 
 export interface CreateTriggerInput {
@@ -46,6 +48,7 @@ export interface CreateTriggerInput {
   description?: string;
   /** Explicit id (used when restoring); generated when omitted. */
   id?: string;
+  origin?: "agent" | "dashboard";
 }
 
 export class TriggerStore {
@@ -74,6 +77,7 @@ export class TriggerStore {
       ...(input.inputs ? { inputs: input.inputs } : {}),
       enabled: input.enabled !== false,
       ...(input.description ? { description: input.description } : {}),
+      ...(input.origin ? { origin: input.origin } : {}),
       createdAt: now,
       updatedAt: now,
     };

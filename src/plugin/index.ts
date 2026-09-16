@@ -23,6 +23,7 @@ import type { FlowDefinition, FlowNode, PluginConfig, BranchNode, ConditionNode,
 // scheduler at module scope, like the flow server's activeServer, and retire
 // it before arming its replacement.
 let activeScheduler: TriggerScheduler | null = null;
+let activeTriggerStore: TriggerStore | null = null;
 
 /** The scheduler currently armed in this process (tests + diagnostics). */
 export function activeTriggerScheduler(): TriggerScheduler | null {
@@ -112,19 +113,6 @@ function register(api: PluginApi) {
   const runner = new FlowRunner(pluginCfg);
   const store = runner.getStore();
 
-  // ---- Flow server (optional) ---------------------------------------------------
-  // Skip when spawned as a child agent (CLAWFLOW_NO_SERVE) to avoid port conflicts.
-  if (pluginCfg.serve && !process.env.CLAWFLOW_NO_SERVE) {
-    startFlowServer({
-      runner,
-      serve: pluginCfg.serve,
-      // Same workspace the flow_* tools use, so a triggered run resolves the
-      // published version exactly like flow_run does.
-      workspace,
-      logger: api.logger,
-    });
-  }
-
   // ---- Trigger scheduler --------------------------------------------------------
   // Fires scheduled flows on this box. Skipped for child agents alongside the
   // flow server so a spawned agent never double-fires its parent's triggers.
@@ -140,7 +128,27 @@ function register(api: PluginApi) {
   if (!process.env.CLAWFLOW_NO_SERVE) {
     activeScheduler?.stop();
     activeScheduler = scheduler;
+    activeTriggerStore = triggerStore;
     scheduler.start();
+  }
+
+  // ---- Flow server (optional) ---------------------------------------------------
+  // Skip when spawned as a child agent (CLAWFLOW_NO_SERVE) to avoid port conflicts.
+  // Started after the scheduler so its trigger routes can reach it; the
+  // accessor keeps them on the currently armed scheduler across reloads.
+  if (pluginCfg.serve && !process.env.CLAWFLOW_NO_SERVE) {
+    startFlowServer({
+      runner,
+      serve: pluginCfg.serve,
+      // Same workspace the flow_* tools use, so a triggered run resolves the
+      // published version exactly like flow_run does.
+      workspace,
+      logger: api.logger,
+      triggers: () =>
+        activeScheduler && activeTriggerStore
+          ? { store: activeTriggerStore, scheduler: activeScheduler }
+          : null,
+    });
   }
 
   // ---- Approval gate for flow_run -----------------------------------------------
@@ -2079,6 +2087,7 @@ By default a trigger runs the latest PUBLISHED version; pin one with "version".`
                 inputs: params.inputs,
                 version: params.version,
                 description: params.description,
+                origin: "agent",
               });
               scheduler.sync();
               const stored = triggerStore.get(record.id) ?? record;
