@@ -3,6 +3,8 @@ import * as path from "path";
 import type { FlowDefinition, ServeConfig } from "./types.js";
 import type { FlowRunner } from "./runner.js";
 import { validateFlow } from "./validate.js";
+import type { CreateTriggerInput, TriggerRecord, TriggerStore } from "./triggers.js";
+import { assertValidSchedule, type TriggerScheduler } from "./scheduler.js";
 import { resolveRunnableFlow } from "./manage.js";
 
 // ---- Flow Server ----------------------------------------------------------------
@@ -28,6 +30,14 @@ export interface FlowServerOpts {
     warn: (msg: string) => void;
     error: (msg: string) => void;
   };
+  /**
+   * Trigger CRUD for the dashboard (/:basePath/triggers). An accessor, not a
+   * captured instance: register() re-runs on plugin reloads and replaces the
+   * scheduler while this server instance survives (activeServer guard), so
+   * the routes must reach the scheduler that is armed right now, never the
+   * one that was armed when the server first started.
+   */
+  triggers?: () => { store: TriggerStore; scheduler: TriggerScheduler } | null;
 }
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
@@ -124,6 +134,183 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
           `[clawflow] validate error: ${err instanceof Error ? err.message : String(err)}`,
         );
         json(res, 500, { error: "Internal server error" });
+      }
+      return;
+    }
+
+    // Trigger CRUD — the HTTP twin of the flow_trigger tool, so a schedule
+    // made from the dashboard is validated exactly like one the agent makes:
+    //   GET    /:basePath/triggers[?flow=]      list (with live nextRunAt)
+    //   POST   /:basePath/triggers              create { flow, cron, tz?, inputs?, description?, enabled?, version? }
+    //   PATCH  /:basePath/triggers/:id          update any of those, enabled:false pauses
+    //   DELETE /:basePath/triggers/:id
+    //   POST   /:basePath/triggers/:id/run      fire now (202; the run is async)
+    const triggersBase = `${basePath}/triggers`;
+    if (pathname === triggersBase || pathname.startsWith(`${triggersBase}/`)) {
+      const wired = opts.triggers?.() ?? null;
+      if (!wired) {
+        json(res, 501, { error: "Trigger scheduler not available on this server" });
+        return;
+      }
+      const { store, scheduler } = wired;
+      const rest = pathname.slice(triggersBase.length).replace(/^\//, "");
+      const [id, action, extra] = rest ? rest.split("/") : [];
+      const withNext = (r: TriggerRecord) => ({
+        ...r,
+        nextRunAt: scheduler.nextRun(r.id)?.toISOString() ?? r.nextRunAt ?? null,
+      });
+      const readJson = async (): Promise<Record<string, unknown> | null> => {
+        const raw = await readBody(req);
+        if (!raw) return {};
+        try {
+          const parsed = JSON.parse(raw);
+          return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : null;
+        } catch {
+          return null;
+        }
+      };
+      const validVersion = (v: unknown): v is number | "@published" =>
+        v === "@published" || (typeof v === "number" && Number.isInteger(v) && v > 0);
+      try {
+        if (extra !== undefined) {
+          json(res, 404, { error: "Not found" });
+          return;
+        }
+        if (!id && req.method === "GET") {
+          const flow = url.searchParams.get("flow") ?? undefined;
+          const records = store.list(flow ? { flowName: flow } : undefined);
+          json(res, 200, { ok: true, triggers: records.map(withNext) });
+          return;
+        }
+        if (!id && req.method === "POST") {
+          const body = await readJson();
+          if (!body) {
+            json(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          const flowName =
+            typeof body.flow === "string" ? body.flow
+            : typeof body.flowName === "string" ? body.flowName
+            : null;
+          if (!flowName || typeof body.cron !== "string") {
+            json(res, 400, { error: '"flow" and "cron" are required' });
+            return;
+          }
+          if (body.tz !== undefined && typeof body.tz !== "string") {
+            json(res, 400, { error: '"tz" must be an IANA timezone string' });
+            return;
+          }
+          if (body.version !== undefined && !validVersion(body.version)) {
+            json(res, 400, { error: '"version" must be a positive integer or "@published"' });
+            return;
+          }
+          if (!resolveRunnableFlow(workspace, flowsDir, flowName)) {
+            json(res, 404, { error: `Flow not found: ${flowName}` });
+            return;
+          }
+          assertValidSchedule(body.cron, body.tz as string | undefined);
+          const input: CreateTriggerInput = {
+            flowName,
+            cron: body.cron,
+            ...(typeof body.tz === "string" ? { tz: body.tz } : {}),
+            ...(body.inputs && typeof body.inputs === "object" && !Array.isArray(body.inputs)
+              ? { inputs: body.inputs as Record<string, unknown> }
+              : {}),
+            ...(body.version !== undefined ? { version: body.version as number | "@published" } : {}),
+            ...(typeof body.description === "string" ? { description: body.description } : {}),
+            ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
+            origin: body.origin === "agent" ? "agent" : "dashboard",
+          };
+          const record = store.create(input);
+          scheduler.sync();
+          log.info(`[clawflow] trigger ${record.id} created via http → ${flowName} (${record.cron})`);
+          json(res, 201, { ok: true, trigger: withNext(store.get(record.id) ?? record) });
+          return;
+        }
+        if (id && !action && req.method === "PATCH") {
+          const current = store.get(id);
+          if (!current) {
+            json(res, 404, { error: `Trigger not found: ${id}` });
+            return;
+          }
+          const body = await readJson();
+          if (!body) {
+            json(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (body.cron !== undefined && typeof body.cron !== "string") {
+            json(res, 400, { error: '"cron" must be a string' });
+            return;
+          }
+          if (body.tz !== undefined && typeof body.tz !== "string") {
+            json(res, 400, { error: '"tz" must be an IANA timezone string' });
+            return;
+          }
+          if (body.version !== undefined && !validVersion(body.version)) {
+            json(res, 400, { error: '"version" must be a positive integer or "@published"' });
+            return;
+          }
+          const cron = typeof body.cron === "string" ? body.cron : current.cron;
+          const tz = typeof body.tz === "string" ? body.tz : current.tz;
+          // Re-validate the resulting schedule, not just the field that
+          // changed — a new tz can invalidate an expression that was fine.
+          assertValidSchedule(cron, tz);
+          const patch: Partial<TriggerRecord> = { cron };
+          if (typeof body.tz === "string") patch.tz = body.tz;
+          if (body.inputs !== undefined) {
+            if (body.inputs === null) patch.inputs = undefined;
+            else if (typeof body.inputs === "object" && !Array.isArray(body.inputs)) {
+              patch.inputs = body.inputs as Record<string, unknown>;
+            } else {
+              json(res, 400, { error: '"inputs" must be an object' });
+              return;
+            }
+          }
+          if (body.version !== undefined) patch.version = body.version as number | "@published";
+          if (typeof body.description === "string") patch.description = body.description;
+          if (typeof body.enabled === "boolean") {
+            patch.enabled = body.enabled;
+            if (!body.enabled) patch.nextRunAt = undefined;
+          }
+          store.update(id, patch);
+          scheduler.sync();
+          json(res, 200, { ok: true, trigger: withNext(store.get(id)!) });
+          return;
+        }
+        if (id && !action && req.method === "DELETE") {
+          if (!store.remove(id)) {
+            json(res, 404, { error: `Trigger not found: ${id}` });
+            return;
+          }
+          scheduler.sync();
+          log.info(`[clawflow] trigger ${id} deleted via http`);
+          json(res, 200, { ok: true, id });
+          return;
+        }
+        if (id && action === "run" && req.method === "POST") {
+          if (!store.get(id)) {
+            json(res, 404, { error: `Trigger not found: ${id}` });
+            return;
+          }
+          // Same contract as /:flowName/run: acknowledge, then run detached.
+          // The outcome lands on the record (lastInstanceId / lastStatus).
+          json(res, 202, { ok: true, id });
+          scheduler.runNow(id).then((result) => {
+            if (result && !result.ok) {
+              log.error(`[clawflow] trigger ${id} run-now failed: ${result.error ?? "unknown error"}`);
+            }
+          }).catch((err) => {
+            log.error(`[clawflow] trigger ${id} run-now crashed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+          return;
+        }
+        json(res, 404, { error: "Not found" });
+      } catch (err) {
+        // Everything that throws here is a client-side problem: a schedule the
+        // validator rejects, a duplicate id, a record that vanished mid-request.
+        json(res, 400, { error: err instanceof Error ? err.message : String(err) });
       }
       return;
     }
