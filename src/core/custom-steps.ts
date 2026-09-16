@@ -141,8 +141,23 @@ export class StepRegistry {
   }
 }
 
-/** Module-level default registry shared by host applications. */
-export const defaultRegistry = new StepRegistry();
+/**
+ * Process-wide default registry shared by host applications.
+ *
+ * Held on `globalThis` under a registered symbol, not as a plain module
+ * singleton. Node caches ES modules by resolved path, so a plugin importing
+ * ClawFlow from `src/index.ts` and a gateway running `dist/index.js` used to
+ * get two registries: the plugin's steps landed in one the engine never
+ * read, and flows failed validation with "Unknown node type". House plugins
+ * flipped between the two paths more than once (agent-tools fixed in
+ * July, openclaw-email still wrong in September). With one registry per
+ * process the import path no longer matters, and neither does a second
+ * copy of the package on disk.
+ */
+const REGISTRY_KEY = Symbol.for("@clawnify/clawflow/step-registry");
+type RegistryHolder = { [REGISTRY_KEY]?: StepRegistry };
+const holder = globalThis as unknown as RegistryHolder;
+export const defaultRegistry: StepRegistry = holder[REGISTRY_KEY] ?? (holder[REGISTRY_KEY] = new StepRegistry());
 
 /**
  * Register a custom step type on the default registry. Call once at startup.
