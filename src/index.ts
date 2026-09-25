@@ -72,3 +72,22 @@ export {
   resolveRunnableFlow,
 } from "./core/manage.js";
 export type { PublishResult } from "./core/manage.js";
+export {
+  listRuns,
+  summarizeRun,
+  runView,
+  readRunValue,
+  pruneRuns,
+  ON_BOX_RESULT_CHARS,
+  DEFAULT_RUN_RETENTION_DAYS,
+} from "./core/runs.js";
+export type {
+  RunRow,
+  RunPage,
+  ListRunsOptions,
+  RunSummary,
+  TraceSummary,
+  ValueOutline,
+  ReadValueOptions,
+  PruneResult,
+} from "./core/runs.js";

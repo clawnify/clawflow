@@ -570,6 +570,10 @@ Every flow run gets a unique `instanceId`. The runner persists state after every
 - A node that took 30 seconds to run won't run again on resume — its memoized output is loaded from disk.
 - An approval-gated flow can stay paused for days. The state survives indefinitely.
 
+**Retention.** Finished runs (completed, failed, cancelled) are deleted 30 days after their last update, together with their loop and branch instance files, by a daily sweep in the gateway process. Set `runRetentionDays` in the plugin config to change it; `0` keeps every run. Running, paused and waiting runs are never deleted.
+
+**Reading runs.** `flow_status` lists runs newest first, 20 per page (`limit`, then `cursor` from the previous page). One run comes back whole when it is small, and otherwise as a summary: status, error, each state key with its size, and the trace without outputs. Read any single value with `path`, e.g. `state.leads` or `trace.3.output`; arrays and long strings come back a page at a time (`offset`, `limit`). `flow_run` and `flow_resume` return the same summary when a run is too large to read in one tool result. The same functions (`listRuns`, `summarizeRun`, `readRunValue`, `pruneRuns`) are exported for other hosts.
+
 This is the lightweight equivalent of Cloudflare Durable Objects' memoization. Cloudflare does it at the infrastructure level with global durability. We do it at the file system level for local/self-hosted use.
 
 ---
@@ -590,7 +594,7 @@ Eleven tools registered in OpenClaw:
 | `flow_run` | Execute a flow (uses latest published version by default) |
 | `flow_resume` | Resume after an approval gate |
 | `flow_send_event` | Push an event into a waiting flow |
-| `flow_status` | Inspect any running or completed instance |
+| `flow_status` | List instances a page at a time, or inspect one (a summary when large, one value by `path`) |
 | `flow_list` | List all flows with metadata, expected inputs, and version info |
 | `flow_read` | Read a flow definition (draft or specific version), inspect single nodes |
 | `flow_publish` | Publish current draft as a new numbered version |

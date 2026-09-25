@@ -531,6 +531,12 @@ export interface PluginConfig {
   memoryDir?: string;
   maxNodeDurationMs?: number;
   stateDir?: string; // where to persist flow state across restarts
+  /**
+   * Days to keep finished runs (completed, failed, cancelled) in `stateDir`.
+   * Older ones are deleted by a daily sweep in the serving process; running,
+   * paused and waiting runs are never deleted. Default 30; 0 keeps every run.
+   */
+  runRetentionDays?: number;
   /** Override for AI inference — used by tests and embedders */
   inferenceFn?: InferenceFn;
   /** OpenClaw agent ID for do:agent nodes (e.g. "ops"). Falls back to --local if unset. */

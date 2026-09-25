@@ -14,6 +14,13 @@ import {
   readVersion as readVersionCore,
   resolveFlowFile as resolveFlowFileCore,
 } from "../core/manage.js";
+import {
+  DEFAULT_RUN_RETENTION_DAYS,
+  listRuns,
+  pruneRuns,
+  readRunValue,
+  runView,
+} from "../core/runs.js";
 import type { FlowDefinition, FlowNode, PluginConfig, BranchNode, ConditionNode, LoopNode, ParallelNode } from "../core/types.js";
 
 // OpenClaw calls register() more than once per gateway process (every config
@@ -28,6 +35,38 @@ let activeTriggerStore: TriggerStore | null = null;
 /** The scheduler currently armed in this process (tests + diagnostics). */
 export function activeTriggerScheduler(): TriggerScheduler | null {
   return activeScheduler;
+}
+
+// Run retention: a daily sweep of finished runs older than runRetentionDays,
+// armed only by the serving process (one per box). Module scope for the same
+// reason as the scheduler: register() runs again on every reload, and each call
+// must retire the previous sweep before arming its own.
+let retentionTimers: Array<ReturnType<typeof setTimeout>> = [];
+
+function armRetention(
+  stateDir: string,
+  retentionDays: number,
+  logger?: { info: (msg: string) => void; warn: (msg: string) => void },
+): void {
+  for (const t of retentionTimers) clearTimeout(t);
+  retentionTimers = [];
+  if (!(retentionDays > 0)) return;
+  const sweep = () => {
+    try {
+      const { runs, files } = pruneRuns(stateDir, retentionDays);
+      if (files) {
+        logger?.info(`clawflow: retention deleted ${runs} runs (${files} files) older than ${retentionDays} days`);
+      }
+    } catch (err) {
+      logger?.warn(`clawflow: retention sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  // First sweep a minute after start, off the startup path; then daily.
+  const first = setTimeout(sweep, 60_000);
+  const daily = setInterval(sweep, 24 * 60 * 60 * 1000);
+  first.unref?.();
+  daily.unref?.();
+  retentionTimers = [first, daily];
 }
 
 /**
@@ -160,6 +199,7 @@ function register(api: PluginApi) {
     activeScheduler = scheduler;
     activeTriggerStore = triggerStore;
     scheduler.start();
+    armRetention(store.dir, pluginCfg.runRetentionDays ?? DEFAULT_RUN_RETENTION_DAYS, api.logger);
   }
 
   // ---- Flow server (optional) ---------------------------------------------------
@@ -752,9 +792,11 @@ Set version to run a specific published version.`,
         try {
           const result = await runner.run(flowDef, params.input ?? {});
           const out = { ...result, _source: source };
+          // Whole when it fits, else a summary the agent reads on from with
+          // flow_status { instanceId, path } (see core/runs.ts).
           return {
             content: [
-              { type: "text", text: JSON.stringify(out, null, 2) },
+              { type: "text", text: JSON.stringify(runView(out)) },
             ],
             details: out,
           };
@@ -823,7 +865,7 @@ You must pass the original flow definition back so the runner can continue.`,
           );
           return {
             content: [
-              { type: "text", text: JSON.stringify(result, null, 2) },
+              { type: "text", text: JSON.stringify(runView(result)) },
             ],
             details: result,
           };
@@ -909,7 +951,9 @@ payload is passed as the output of the wait node and into flow state.`,
   api.registerTool(
     {
       name: "flow_status",
-      description: `Get the status and state of a flow instance, or list all instances.
+      description: `Get the status and state of a flow instance, or list instances.
+Without instanceId: runs newest first, 20 per page (limit, then cursor = the returned next_cursor), filtered by flow and status.
+With instanceId: the run whole when it is small, else a summary (status, error, each state key with its size, the trace without outputs). Read any one value with path, e.g. "state.leads" or "trace.3.output"; arrays and long strings come back a page at a time (offset, limit).
 Status values: running | completed | paused | waiting | failed | cancelled`,
 
       parameters: {
@@ -917,7 +961,30 @@ Status values: running | completed | paused | waiting | failed | cancelled`,
         properties: {
           instanceId: {
             type: "string",
-            description: "Specific instance to inspect. Omit to list all.",
+            description: "Specific instance to inspect. Omit to list instances.",
+          },
+          path: {
+            type: "string",
+            description:
+              "With instanceId: one value of the run as a dot path, e.g. \"state.leads\", \"trace.3.output\", \"completedNodes.fetch\".",
+          },
+          offset: {
+            type: "number",
+            description:
+              "With path: where the page starts (an item index for an array, a character index for a string). Use next_offset from the previous page.",
+          },
+          limit: {
+            type: "number",
+            description:
+              "Without instanceId: runs per page (default 20, max 100). With path: items (array) or characters (string) per page.",
+          },
+          cursor: {
+            type: "string",
+            description: "Without instanceId: the next_cursor from the previous page.",
+          },
+          flow: {
+            type: "string",
+            description: "Without instanceId: only runs of this flow.",
           },
           filter: {
             type: "string",
@@ -929,40 +996,53 @@ Status values: running | completed | paused | waiting | failed | cancelled`,
 
       async execute(
         _id: string,
-        params: { instanceId?: string; filter?: string },
+        params: {
+          instanceId?: string;
+          path?: string;
+          offset?: number;
+          limit?: number;
+          cursor?: string;
+          flow?: string;
+          filter?: string;
+        },
       ) {
-        if (params.instanceId) {
-          const record = store.get(params.instanceId);
-          if (!record)
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Instance not found: ${params.instanceId}`,
-                },
-              ],
-            };
+        const text = (value: unknown) => ({
+          content: [{ type: "text", text: JSON.stringify(value) }],
+        });
+        try {
+          if (params.instanceId) {
+            const record = store.get(params.instanceId);
+            if (!record)
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Instance not found: ${params.instanceId}`,
+                  },
+                ],
+              };
+            if (params.path) {
+              return text(readRunValue(record, params.path, { offset: params.offset, limit: params.limit }));
+            }
+            return { ...text(runView(record)), details: record };
+          }
+          const page = listRuns(store.dir, {
+            limit: params.limit,
+            cursor: params.cursor,
+            flow: params.flow,
+            status: params.filter,
+          });
+          return { ...text(page), details: page };
+        } catch (err) {
           return {
             content: [
-              { type: "text", text: JSON.stringify(record, null, 2) },
+              {
+                type: "text",
+                text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+              },
             ],
-            details: record,
           };
         }
-        const records = store.list(params.filter);
-        const summary = records.map((r) => ({
-          instanceId: r.instanceId,
-          flow: r.flowName,
-          status: r.status,
-          updatedAt: r.updatedAt,
-          waitingFor: r.waitingFor,
-        }));
-        return {
-          content: [
-            { type: "text", text: JSON.stringify(summary, null, 2) },
-          ],
-          details: summary,
-        };
       },
     },
     { optional: true },
