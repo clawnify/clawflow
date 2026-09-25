@@ -47,6 +47,10 @@
       "stateDir": {
         "type": "string"
       },
+      "runRetentionDays": {
+        "type": "number",
+        "minimum": 0
+      },
       "maxNodeDurationMs": {
         "type": "number"
       },

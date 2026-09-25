@@ -31,7 +31,8 @@ export interface InstanceRecord {
 }
 
 export class StateStore {
-  private dir: string;
+  /** The state directory: one `<instanceId>.json` per run (see runs.ts for reads). */
+  readonly dir: string;
 
   constructor(stateDir?: string) {
     this.dir =
