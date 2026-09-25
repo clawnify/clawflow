@@ -17,9 +17,9 @@ import {
 import {
   DEFAULT_RUN_RETENTION_DAYS,
   listRuns,
-  pruneRuns,
   readRunValue,
   runView,
+  sweepRuns,
 } from "../core/runs.js";
 import type { FlowDefinition, FlowNode, PluginConfig, BranchNode, ConditionNode, LoopNode, ParallelNode } from "../core/types.js";
 
@@ -37,11 +37,13 @@ export function activeTriggerScheduler(): TriggerScheduler | null {
   return activeScheduler;
 }
 
-// Run retention: a daily sweep of finished runs older than runRetentionDays,
+// Run sweep: a daily pass over the state directory (index backfill, then
+// retention of finished runs older than runRetentionDays; see sweepRuns),
 // armed only by the serving process (one per box). Module scope for the same
 // reason as the scheduler: register() runs again on every reload, and each call
 // must retire the previous sweep before arming its own.
 let retentionTimers: Array<ReturnType<typeof setTimeout>> = [];
+let sweeping = false;
 
 function armRetention(
   stateDir: string,
@@ -50,16 +52,23 @@ function armRetention(
 ): void {
   for (const t of retentionTimers) clearTimeout(t);
   retentionTimers = [];
-  if (!(retentionDays > 0)) return;
+  // Armed even with retention off: the index backfill runs either way.
   const sweep = () => {
-    try {
-      const { runs, files } = pruneRuns(stateDir, retentionDays);
-      if (files) {
-        logger?.info(`clawflow: retention deleted ${runs} runs (${files} files) older than ${retentionDays} days`);
-      }
-    } catch (err) {
-      logger?.warn(`clawflow: retention sweep failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    if (sweeping) return;
+    sweeping = true;
+    sweepRuns(stateDir, retentionDays)
+      .then(({ indexed, runs, files }) => {
+        if (indexed) logger?.info(`clawflow: indexed ${indexed} runs`);
+        if (files) {
+          logger?.info(`clawflow: retention deleted ${runs} runs (${files} files) older than ${retentionDays} days`);
+        }
+      })
+      .catch((err) => {
+        logger?.warn(`clawflow: run sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => {
+        sweeping = false;
+      });
   };
   // First sweep a minute after start, off the startup path; then daily.
   const first = setTimeout(sweep, 60_000);

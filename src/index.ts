@@ -77,7 +77,7 @@ export {
   summarizeRun,
   runView,
   readRunValue,
-  pruneRuns,
+  sweepRuns,
   ON_BOX_RESULT_CHARS,
   DEFAULT_RUN_RETENTION_DAYS,
 } from "./core/runs.js";
@@ -89,5 +89,5 @@ export type {
   TraceSummary,
   ValueOutline,
   ReadValueOptions,
-  PruneResult,
+  SweepResult,
 } from "./core/runs.js";

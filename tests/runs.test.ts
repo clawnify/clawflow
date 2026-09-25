@@ -6,7 +6,8 @@ import * as os from "os";
 import { randomUUID } from "crypto";
 
 import plugin from "../src/plugin/index.js";
-import { listRuns, pruneRuns, readRunValue, runView, summarizeRun } from "../src/index.js";
+import { FlowRunner, listRuns, readRunValue, runView, summarizeRun, sweepRuns } from "../src/index.js";
+import { writeRunIndex } from "../src/core/store.js";
 import type { RunPage, RunSummary } from "../src/index.js";
 
 const roots: string[] = [];
@@ -184,11 +185,12 @@ describe("readRunValue", () => {
   });
 });
 
-describe("pruneRuns", () => {
+describe("sweepRuns", () => {
   const now = Date.UTC(2026, 8, 25);
   const daysAgo = (d: number) => new Date(now - d * 86_400_000).toISOString();
+  const indexDir = (dir: string) => path.join(dir, "_index");
 
-  it("deletes finished runs past retention with their sub-flow files, and nothing else", () => {
+  it("deletes finished runs past retention with their sub-flow files and index entries, and nothing else", async () => {
     const dir = stateDir();
     const old = seed(dir, { status: "completed", createdAt: daysAgo(40) });
     const oldFailed = seed(dir, { status: "failed", createdAt: daysAgo(31) });
@@ -200,20 +202,81 @@ describe("pruneRuns", () => {
     fs.writeFileSync(path.join(dir, `${recent}_loop_each_0.json`), "{}");
     fs.writeFileSync(path.join(dir, "_pending-approvals.json"), "[]");
 
-    assert.deepEqual(pruneRuns(dir, 30, now), { runs: 2, files: 4 });
+    assert.deepEqual(await sweepRuns(dir, 30, now), { indexed: 5, runs: 2, files: 4 });
     const left = fs.readdirSync(dir).sort();
     assert.deepEqual(
       left,
-      [`${paused}.json`, `${recent}.json`, `${recent}_loop_each_0.json`, `${waiting}.json`, "_pending-approvals.json"].sort(),
+      [`${paused}.json`, `${recent}.json`, `${recent}_loop_each_0.json`, `${waiting}.json`, "_index", "_pending-approvals.json"].sort(),
     );
     assert.equal(left.includes(`${oldFailed}.json`), false);
+    assert.deepEqual(fs.readdirSync(indexDir(dir)).sort(), [`${paused}.json`, `${recent}.json`, `${waiting}.json`].sort());
   });
 
-  it("keeps everything when retention is 0", () => {
+  it("indexes even when retention is 0, and deletes nothing", async () => {
     const dir = stateDir();
     seed(dir, { status: "completed", createdAt: daysAgo(400) });
-    assert.deepEqual(pruneRuns(dir, 0, now), { runs: 0, files: 0 });
-    assert.equal(fs.readdirSync(dir).length, 1);
+    assert.deepEqual(await sweepRuns(dir, 0, now), { indexed: 1, runs: 0, files: 0 });
+    assert.equal(fs.readdirSync(indexDir(dir)).length, 1);
+  });
+
+  it("backfills once, re-indexes a rewritten record, and drops entries whose run is gone", async () => {
+    const dir = stateDir();
+    const id = seed(dir, { status: "running", createdAt: minute(1) });
+    assert.equal((await sweepRuns(dir, 0, now)).indexed, 1);
+    // A second sweep finds the entry current and parses nothing.
+    assert.equal((await sweepRuns(dir, 0, now)).indexed, 0);
+
+    const recordFile = path.join(dir, `${id}.json`);
+    const record = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+    fs.writeFileSync(recordFile, JSON.stringify({ ...record, status: "completed" }));
+    assert.equal((await sweepRuns(dir, 0, now)).indexed, 1);
+    assert.equal(listRuns(dir).runs[0].status, "completed");
+
+    fs.writeFileSync(path.join(indexDir(dir), "gone.json"), "{}");
+    await sweepRuns(dir, 0, now);
+    assert.equal(fs.existsSync(path.join(indexDir(dir), "gone.json")), false);
+  });
+});
+
+describe("run index", () => {
+  it("is written by the store for runs, not for sub-flow instances", async () => {
+    const dir = stateDir();
+    const runner = new FlowRunner({ stateDir: dir });
+    const result = await runner.run(
+      { flow: "idx", nodes: [{ name: "each", do: "loop", over: "inputs.items", as: "x", nodes: [{ name: "c", do: "code", run: "1" }] }] },
+      { items: [1, 2] },
+    );
+    const entries = fs.readdirSync(path.join(dir, "_index"));
+    assert.deepEqual(entries, [`${result.instanceId}.json`]);
+    const entry = JSON.parse(fs.readFileSync(path.join(dir, "_index", entries[0]), "utf8"));
+    assert.equal(entry.run.status, "completed");
+    assert.equal(entry.run.flowName, "idx");
+    assert.equal(typeof entry.record.size, "number");
+  });
+
+  it("lists from a current entry without reading the record", () => {
+    const dir = stateDir();
+    const id = seed(dir, { flow: "fast", createdAt: minute(1) });
+    const recordFile = path.join(dir, `${id}.json`);
+    const pinned = new Date(Date.now() - 60_000);
+    fs.utimesSync(recordFile, pinned, pinned);
+    writeRunIndex(dir, id, JSON.parse(fs.readFileSync(recordFile, "utf8")));
+    // Replace the record with garbage of the same size and the same mtime: the
+    // entry still names this version, so a list that parsed the record would
+    // drop the run and a list that trusts the entry keeps it.
+    fs.writeFileSync(recordFile, "x".repeat(fs.statSync(recordFile).size));
+    fs.utimesSync(recordFile, pinned, pinned);
+    assert.equal(listRuns(dir).runs[0]?.flowName, "fast");
+  });
+
+  it("ignores an entry for an older version of the record", () => {
+    const dir = stateDir();
+    const id = seed(dir, { status: "running", createdAt: minute(1) });
+    const recordFile = path.join(dir, `${id}.json`);
+    const record = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+    writeRunIndex(dir, id, record);
+    fs.writeFileSync(recordFile, JSON.stringify({ ...record, status: "completed" }));
+    assert.equal(listRuns(dir).runs[0].status, "completed");
   });
 });
 

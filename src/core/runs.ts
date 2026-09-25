@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { InstanceRecord } from "./store.js";
+import { RUN_INDEX_DIR, readFreshRunIndex, runIndexEntry, writeRunIndex } from "./store.js";
+import type { InstanceRecord, RunIndexEntry } from "./store.js";
 import type { FlowResult, TraceEntry } from "./types.js";
 
 // ---- Run reads + retention -------------------------------------------------------
@@ -38,18 +39,8 @@ const SUB_FLOW_FILE = /_(loop|condition|branch|parallel)_/;
 
 // ---- List ------------------------------------------------------------------------
 
-export interface RunRow {
-  instanceId: string;
-  flowName: string;
-  status: InstanceRecord["status"];
-  createdAt: string;
-  updatedAt: string;
-  error?: string;
-  resumeToken?: string;
-  waitingFor?: InstanceRecord["waitingFor"];
-  traceCount: number;
-  nodeCount: number;
-}
+/** One run in a list: its index entry (see store.ts, "Run index"). */
+export type RunRow = RunIndexEntry;
 
 export interface RunPage {
   runs: RunRow[];
@@ -86,10 +77,10 @@ export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage 
   }
 
   const rows: RunRow[] = [];
-  for (const record of readTopLevelRecords(stateDir)) {
-    if (opts.flow && record.flowName !== opts.flow) continue;
-    if (opts.status && record.status !== opts.status) continue;
-    rows.push(toRow(record));
+  for (const row of readTopLevelRows(stateDir)) {
+    if (opts.flow && row.flowName !== opts.flow) continue;
+    if (opts.status && row.status !== opts.status) continue;
+    rows.push(row);
   }
   rows.sort(newestFirst);
   const rest = after ? rows.filter((r) => newestFirst(r, after) > 0) : rows;
@@ -99,21 +90,6 @@ export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage 
     runs: page,
     total: rows.length,
     next_cursor: rest.length > limit && last ? encodeCursor(last) : null,
-  };
-}
-
-function toRow(r: InstanceRecord): RunRow {
-  return {
-    instanceId: r.instanceId,
-    flowName: r.flowName,
-    status: r.status,
-    createdAt: r.createdAt,
-    updatedAt: r.updatedAt,
-    ...(r.error ? { error: r.error } : {}),
-    ...(r.resumeToken ? { resumeToken: r.resumeToken } : {}),
-    ...(r.waitingFor ? { waitingFor: r.waitingFor } : {}),
-    traceCount: Array.isArray(r.trace) ? r.trace.length : 0,
-    nodeCount: r.completedNodes ? Object.keys(r.completedNodes).length : 0,
   };
 }
 
@@ -141,20 +117,38 @@ function decodeCursor(cursor: string): Keyed | null {
   }
 }
 
-/** Top-level run records; sub-flow files are skipped by name, before parsing. */
-function* readTopLevelRecords(stateDir: string): Generator<InstanceRecord> {
+/**
+ * One row per top-level run: its index entry when that is fresh, else parsed
+ * from the record (a reader never writes the index; the sweep backfills it).
+ * Sub-flow files are skipped by name, before any read.
+ */
+function* readTopLevelRows(stateDir: string): Generator<RunRow> {
   if (!fs.existsSync(stateDir)) return;
   for (const name of fs.readdirSync(stateDir)) {
     if (!isTopLevelRunFile(name)) continue;
-    let record: InstanceRecord;
-    try {
-      record = JSON.parse(fs.readFileSync(path.join(stateDir, name), "utf8")) as InstanceRecord;
-    } catch {
-      continue;
-    }
-    if (!record || typeof record.instanceId !== "string" || record.instanceId.includes(":")) continue;
-    yield record;
+    const base = name.slice(0, -".json".length);
+    const row = freshIndexEntry(stateDir, base) ?? rowFromRecord(stateDir, base);
+    if (row) yield row;
   }
+}
+
+/** The run's index entry, if it still describes the record on disk. */
+function freshIndexEntry(stateDir: string, base: string): RunIndexEntry | null {
+  return readFreshRunIndex(stateDir, base);
+}
+
+function readRecord(stateDir: string, base: string): InstanceRecord | null {
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(stateDir, `${base}.json`), "utf8")) as InstanceRecord;
+    return record && typeof record.instanceId === "string" && !record.instanceId.includes(":") ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+function rowFromRecord(stateDir: string, base: string): RunRow | null {
+  const record = readRecord(stateDir, base);
+  return record ? runIndexEntry(record) : null;
 }
 
 function isTopLevelRunFile(name: string): boolean {
@@ -391,37 +385,54 @@ export const DEFAULT_RUN_RETENTION_DAYS = 30;
 
 const FINISHED = new Set(["completed", "failed", "cancelled"]);
 
-export interface PruneResult {
+export interface SweepResult {
+  /** Index entries written for runs that had none, or a stale one. */
+  indexed: number;
   /** Top-level runs deleted. */
   runs: number;
-  /** Files deleted, including sub-flow instance files. */
+  /** Files deleted, including sub-flow instance files (index entries not counted). */
   files: number;
 }
 
 /**
- * Delete finished runs (completed, failed, cancelled) last updated more than
- * `retentionDays` ago, with their sub-flow files. Runs that are running, paused
- * or waiting are never deleted: a paused or waiting run is resumed from its
- * record. `retentionDays` 0 deletes nothing.
+ * The state directory's maintenance pass, run by the serving process:
+ *
+ *  1. Backfill the run index: a run with no entry, or one older than its record,
+ *     is parsed once and indexed, stamped with the record's mtime so a record
+ *     written meanwhile (by any process) leaves the entry stale, not wrong.
+ *  2. Retention: delete finished runs (completed, failed, cancelled) last
+ *     updated more than `retentionDays` ago, with their sub-flow files and
+ *     index entries. Runs that are running, paused or waiting are never
+ *     deleted: a paused or waiting run is resumed from its record.
+ *     `retentionDays` 0 deletes nothing.
+ *  3. Drop index entries whose record is gone.
+ *
+ * Async and yielding: it runs inside the gateway process, and parsing records
+ * (megabytes each, on a busy box) in one synchronous pass would stall every
+ * agent on the box while it ran.
  */
-export function pruneRuns(stateDir: string, retentionDays: number, now = Date.now()): PruneResult {
-  const result: PruneResult = { runs: 0, files: 0 };
-  if (!(retentionDays > 0) || !fs.existsSync(stateDir)) return result;
-  const cutoff = now - retentionDays * DAY_MS;
+export async function sweepRuns(stateDir: string, retentionDays: number, now = Date.now()): Promise<SweepResult> {
+  const result: SweepResult = { indexed: 0, runs: 0, files: 0 };
+  if (!fs.existsSync(stateDir)) return result;
+  const cutoff = retentionDays > 0 ? now - retentionDays * DAY_MS : -Infinity;
   const names = fs.readdirSync(stateDir);
   const expired = new Set<string>();
 
+  let cheapReads = 0;
   for (const name of names) {
     if (!isTopLevelRunFile(name)) continue;
-    let record: Partial<InstanceRecord>;
-    try {
-      record = JSON.parse(fs.readFileSync(path.join(stateDir, name), "utf8")) as Partial<InstanceRecord>;
-    } catch {
-      continue;
+    const base = name.slice(0, -".json".length);
+    let entry: RunIndexEntry | null = freshIndexEntry(stateDir, base);
+    if (entry) {
+      if (++cheapReads % 50 === 0) await yieldToLoop();
+    } else {
+      entry = backfillIndex(stateDir, base);
+      if (entry) result.indexed++;
+      await yieldToLoop();
     }
-    const last = Date.parse(record.updatedAt ?? record.createdAt ?? "");
-    if (!FINISHED.has(String(record.status)) || !(last < cutoff)) continue;
-    expired.add(name.slice(0, -".json".length));
+    if (!entry) continue;
+    const last = Date.parse(entry.updatedAt ?? entry.createdAt ?? "");
+    if (FINISHED.has(String(entry.status)) && last < cutoff) expired.add(base);
   }
 
   for (const name of names) {
@@ -438,7 +449,39 @@ export function pruneRuns(stateDir: string, retentionDays: number, now = Date.no
       // Already gone, or not ours to delete: the next sweep retries.
     }
   }
+
+  const indexDir = path.join(stateDir, RUN_INDEX_DIR);
+  if (fs.existsSync(indexDir)) {
+    for (const name of fs.readdirSync(indexDir)) {
+      const file = path.join(indexDir, name);
+      try {
+        const orphan = name.endsWith(".json") && !fs.existsSync(path.join(stateDir, name));
+        const staleTmp = name.endsWith(".tmp") && fs.statSync(file).mtimeMs < now - 3_600_000;
+        if (orphan || staleTmp) fs.unlinkSync(file);
+      } catch {
+        // Next sweep.
+      }
+    }
+  }
   return result;
+}
+
+function backfillIndex(stateDir: string, base: string): RunIndexEntry | null {
+  try {
+    // Stat before parsing: if the record is rewritten in between, the entry
+    // names the older version and is ignored until the next backfill.
+    const stats = fs.statSync(path.join(stateDir, `${base}.json`));
+    const record = readRecord(stateDir, base);
+    if (!record) return null;
+    writeRunIndex(stateDir, base, record, stats);
+    return runIndexEntry(record);
+  } catch {
+    return null;
+  }
+}
+
+function yieldToLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 // ---- Shared ----------------------------------------------------------------------
