@@ -106,6 +106,10 @@ function applyFilter(val: unknown, filter: string): unknown {
 
 // ---- Runner ---------------------------------------------------------------------
 
+/** Nodes that only run other nodes. See runWithRetry for why they get no
+ *  default time limit. */
+const CONTAINER_NODES: ReadonlySet<string> = new Set(["condition", "branch", "loop", "parallel"]);
+
 export class FlowRunner {
   private cfg: PluginConfig;
   private store: StateStore;
@@ -456,29 +460,38 @@ export class FlowRunner {
     attempts?: number;
   }> {
     const policy: RetryPolicy = node.retry ?? { limit: 1, delay: 0 };
+    // The default limit is for one step. A container (condition, branch, loop,
+    // parallel) only groups steps that each carry their own limit, so it gets
+    // none by default; an explicit `timeout` on it still caps the whole group.
     const nodeTimeoutMs = node.timeout
       ? parseDuration(node.timeout)
-      : (this.cfg.maxNodeDurationMs ?? 30_000);
+      : CONTAINER_NODES.has(node.do)
+        ? undefined
+        : (this.cfg.maxNodeDurationMs ?? 30_000);
 
     let lastError: Error = new Error("Unknown error");
 
     for (let attempt = 1; attempt <= policy.limit; attempt++) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const work = this.execNode(node, state, flow, instanceId);
-        const result = await Promise.race([
-          work,
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () =>
-                reject(
-                  new Error(
-                    `Node "${node.name}" timed out after ${nodeTimeoutMs}ms`,
-                  ),
-                ),
-              nodeTimeoutMs,
-            ),
-          ),
-        ]);
+        const result =
+          nodeTimeoutMs === undefined
+            ? await work
+            : await Promise.race([
+                work,
+                new Promise<never>((_, reject) => {
+                  timer = setTimeout(
+                    () =>
+                      reject(
+                        new Error(
+                          `Node "${node.name}" timed out after ${nodeTimeoutMs}ms`,
+                        ),
+                      ),
+                    nodeTimeoutMs,
+                  );
+                }),
+              ]);
         return { ...result, attempts: attempt };
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
@@ -486,6 +499,8 @@ export class FlowRunner {
           const delayMs = this.calcDelay(policy, attempt);
           await new Promise((r) => setTimeout(r, delayMs));
         }
+      } finally {
+        clearTimeout(timer);
       }
     }
     throw lastError;

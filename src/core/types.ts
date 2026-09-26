@@ -529,6 +529,9 @@ export interface PluginConfig {
    */
   defaultProvider?: string;
   memoryDir?: string;
+  /** Default time limit for a single node without its own `timeout`
+   *  (default 30000). Not applied to containers (condition, branch, loop,
+   *  parallel): the nodes inside carry their own limits. */
   maxNodeDurationMs?: number;
   stateDir?: string; // where to persist flow state across restarts
   /**
