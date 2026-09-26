@@ -2493,3 +2493,49 @@ describe("FlowRunner — ai node providers", () => {
     assert.match(JSON.stringify(result), /no API key/);
   });
 });
+
+describe("FlowRunner — container node timeouts", () => {
+  after(cleanup);
+
+  // The default per-node limit is for a single step. A condition or loop only
+  // groups steps that carry their own limits, so it must not cut them short.
+  const shortDefault: PluginConfig = { ...cfg, maxNodeDurationMs: 100 };
+  const slowStep = { name: "slow", do: "exec" as const, command: "sleep 0.4 && echo done", timeout: "5s", output: "slow_out" };
+
+  it("a condition does not time out while its branch runs within the branch's own limits", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-condition-slow-branch",
+      nodes: [{ name: "gate", do: "condition" as const, if: "inputs.go", then: [slowStep] }],
+    };
+    const result = await new FlowRunner(shortDefault).run(flow, { go: true });
+    assert.equal(result.ok, true, JSON.stringify(result.error));
+  });
+
+  it("a loop does not time out while its iterations run within their own limits", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-loop-slow-body",
+      nodes: [{ name: "each", do: "loop" as const, over: "inputs.items", as: "item", nodes: [slowStep], output: "all" }],
+    };
+    const result = await new FlowRunner(shortDefault).run(flow, { items: [1] });
+    assert.equal(result.ok, true, JSON.stringify(result.error));
+  });
+
+  it("an explicit timeout on a container still caps the whole branch", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-condition-explicit-timeout",
+      nodes: [{ name: "gate", do: "condition" as const, if: "inputs.go", timeout: "100ms", then: [slowStep] }],
+    };
+    const result = await new FlowRunner(cfg).run(flow, { go: true });
+    assert.equal(result.ok, false);
+    assert.match(String(result.error), /timed out after 100ms/);
+  });
+
+  it("a single step still gets the default limit", async () => {
+    const flow: FlowDefinition = {
+      flow: "test-leaf-default-timeout",
+      nodes: [{ name: "slow", do: "exec" as const, command: "sleep 0.4", output: "out" }],
+    };
+    const result = await new FlowRunner(shortDefault).run(flow, {});
+    assert.equal(result.ok, false);
+  });
+});

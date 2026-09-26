@@ -49,6 +49,7 @@ A flow is JSON with a `flow` name, an optional `env` block, and a `nodes` array.
 - **CRITICAL: `output` is required to store a node's result in state.** Without it, the result is discarded. This applies to ALL nodes including `loop`, `branch`, `parallel`, `condition`. If a downstream node references a result, the producing node MUST have `output`.
 - Always add `schema` to `ai` nodes when downstream nodes need typed fields
 - Use `retry` on `http` and `ai` nodes: `{ "limit": 3, "delay": "2s", "backoff": "exponential" }`
+- `timeout` limits one node (default 30s, `maxNodeDurationMs`). Give slow steps their own (`agent` nodes often need minutes). Containers (`condition`, `branch`, `loop`, `parallel`) have no default limit: each step inside keeps its own, and a `timeout` set on the container caps the whole group
 - Use `do: exec` for deterministic operations (scripts, file processing, CLI tools) — never use `do: agent` for pure shell commands
 - Use `do: agent` for tasks that need tools (browser, exec, memory, MCP, CLI) — delegates to a real OpenClaw agent
 - Use `do: ai` for structured extraction and single-turn LLM calls

@@ -2,7 +2,7 @@
   "id": "clawflow",
   "name": "ClawFlow",
   "description": "The n8n for agents. Declarative, AI-native workflow engine \u2014 LLM-writable, Cloudflare-portable.",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "skills": [
     "./skills/clawflow"
   ],
