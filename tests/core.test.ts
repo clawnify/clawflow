@@ -289,6 +289,44 @@ describe("FlowRunner — agent node field resolution", () => {
   });
 });
 
+describe("FlowRunner: the step a run is executing, on its record", () => {
+  after(cleanup);
+
+  const flow: FlowDefinition = {
+    flow: "step",
+    nodes: [{ name: "ask", do: "agent" as const, sessionKey: "agent:main:{{ inputs.chat }}", task: "Reply OK", timeout: "90s" }],
+  };
+
+  it("records the step while it runs, with an agent step's resolved session, and clears it after", async () => {
+    const runner = new FlowRunner(cfg) as any;
+    let seen: any;
+    runner.tryOpenClawAgent = async () => {
+      seen = runner.getStore().get("run-step-ok")?.running;
+      return "OK";
+    };
+    const result = await runner.run(flow, { chat: "c1" }, "run-step-ok");
+    assert.equal(result.ok, true);
+    assert.equal(seen?.node, "ask");
+    assert.equal(seen?.do, "agent");
+    assert.equal(seen?.timeoutMs, 90_000);
+    assert.deepEqual(seen?.target, { sessionKey: "agent:main:c1" });
+    assert.ok(!Number.isNaN(Date.parse(seen?.startedAt)), "startedAt is a timestamp");
+    assert.equal(runner.getStore().get("run-step-ok").running, undefined);
+  });
+
+  it("clears it when the step fails", async () => {
+    const runner = new FlowRunner(cfg) as any;
+    runner.tryOpenClawAgent = async () => {
+      throw new Error("boom");
+    };
+    const result = await runner.run(flow, { chat: "c1" }, "run-step-fail");
+    assert.equal(result.ok, false);
+    const record = runner.getStore().get("run-step-fail");
+    assert.equal(record.status, "failed");
+    assert.equal(record.running, undefined);
+  });
+});
+
 describe("FlowRunner: an agent step targeting the flow_run caller's session", () => {
   after(cleanup);
 

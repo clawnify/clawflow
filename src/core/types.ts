@@ -413,6 +413,21 @@ export interface TraceEntry {
   durationMs: number;
 }
 
+/** The top-level step a run is executing now. The trace only gains an entry
+ *  when a step ends, so without this a running flow shows nothing about what
+ *  it is doing or what it is waiting on. */
+export interface RunningStep {
+  node: string;
+  do: string;
+  startedAt: string;
+  /** How long one attempt may run before it fails, so a reader can say how
+   *  long the step may still wait. */
+  timeoutMs: number;
+  /** Agent steps: the resolved session the step runs in. Its turn waits for
+   *  any turn already running in that session. */
+  target?: { agent?: string; sessionKey?: string; sessionId?: string };
+}
+
 export type FlowStatus =
   | "running"
   | "completed"

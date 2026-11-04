@@ -35,6 +35,7 @@ export type {
   FlowStatus,
   InputSpec,
   TraceEntry,
+  RunningStep,
   NodeStatus,
   RetryPolicy,
   PluginConfig,
