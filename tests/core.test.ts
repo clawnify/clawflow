@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
-import { FlowRunner, parseDuration, transpileToCloudflare, validateFlow } from "../src/index.js";
+import { FlowRunner, parseDuration, targetsCallerSession, transpileToCloudflare, validateFlow } from "../src/index.js";
 import type { FlowDefinition, PluginConfig } from "../src/index.js";
 
 // Use a temp dir for state so tests don't pollute the real store
@@ -324,6 +324,65 @@ describe("FlowRunner: the step a run is executing, on its record", () => {
     const record = runner.getStore().get("run-step-fail");
     assert.equal(record.status, "failed");
     assert.equal(record.running, undefined);
+  });
+});
+
+describe("FlowRunner: an agent step targeting the flow_run caller's session", () => {
+  after(cleanup);
+
+  // A flow whose agent step replies in a chat, run with flow_run from that same
+  // chat: flow_run keeps the chat's turn busy until the flow ends, and the
+  // step's turn would queue behind it, so both would wait until the step's
+  // timeout.
+  const chat = "agent:main:user:u1:chat:c1";
+  const flow: FlowDefinition = {
+    flow: "ack",
+    nodes: [{ name: "ack_in_chat", do: "agent" as const, sessionKey: chat, task: "Reply OK" }],
+  };
+
+  function stubbedRunner() {
+    const runner = new FlowRunner(cfg) as any;
+    const calls: unknown[] = [];
+    runner.tryOpenClawAgent = async (_message: string, target: unknown) => {
+      calls.push(target);
+      return "OK";
+    };
+    return { runner, calls };
+  }
+
+  it("fails the step at once instead of starting a turn it would wait on", async () => {
+    const { runner, calls } = stubbedRunner();
+    const result = await runner.run(flow, {}, undefined, { caller: { sessionKey: chat } });
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /same session as the agent that started this flow/);
+    assert.equal(calls.length, 0, "the openclaw agent CLI must not be called");
+  });
+
+  it("runs the step when the caller is another session, or there is no caller", async () => {
+    const other = stubbedRunner();
+    const fromOther = await other.runner.run(flow, {}, undefined, { caller: { sessionKey: "agent:main:main" } });
+    assert.equal(fromOther.ok, true);
+    assert.equal(other.calls.length, 1);
+
+    const trigger = stubbedRunner();
+    const fromTrigger = await trigger.runner.run(flow, {});
+    assert.equal(fromTrigger.ok, true);
+    assert.equal(trigger.calls.length, 1);
+  });
+
+  it("matches keys the way openclaw scopes them", () => {
+    const caller = { sessionKey: chat, sessionId: "sess-1" };
+    assert.equal(targetsCallerSession({ sessionKey: chat }, caller), true);
+    assert.equal(targetsCallerSession({ sessionKey: chat.toUpperCase() }, caller), true);
+    // a bare key is scoped by the step's agent, else the default agent
+    assert.equal(targetsCallerSession({ sessionKey: "user:u1:chat:c1" }, caller), true);
+    assert.equal(targetsCallerSession({ agent: "ops", sessionKey: "user:u1:chat:c1" }, caller), false);
+    assert.equal(targetsCallerSession({ sessionKey: "user:u1:chat:c1" }, caller, "ops"), false);
+    assert.equal(targetsCallerSession({ sessionId: "sess-1" }, caller), true);
+    assert.equal(targetsCallerSession({ sessionKey: "agent:main:user:u1:chat:c2" }, caller), false);
+    // a step that names only an agent runs in a session not resolved here
+    assert.equal(targetsCallerSession({ agent: "main" }, caller), false);
+    assert.equal(targetsCallerSession({ sessionKey: chat }, {}), false);
   });
 });
 
