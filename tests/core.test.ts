@@ -380,8 +380,9 @@ describe("FlowRunner: an agent step targeting the flow_run caller's session", ()
     assert.equal(targetsCallerSession({ sessionKey: "user:u1:chat:c1" }, caller, "ops"), false);
     assert.equal(targetsCallerSession({ sessionId: "sess-1" }, caller), true);
     assert.equal(targetsCallerSession({ sessionKey: "agent:main:user:u1:chat:c2" }, caller), false);
-    // a step that names only an agent runs in a session not resolved here
+    // a step that names only an agent runs in its main session, not this chat
     assert.equal(targetsCallerSession({ agent: "main" }, caller), false);
+    assert.equal(targetsCallerSession({ agent: "main" }, { sessionKey: "agent:main:main" }), true);
     assert.equal(targetsCallerSession({ sessionKey: chat }, {}), false);
   });
 });

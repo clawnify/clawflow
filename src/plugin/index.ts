@@ -112,6 +112,7 @@ export function shouldServe(api: { registrationMode?: string }, argv: readonly s
 //   flow_restore_from_bin       — restore a flow from the bin or list bin contents
 //   flow_run           — execute a flow (inline or from file)
 //   flow_resume        — resume after approval gate
+//   flow_cancel        : cancel a run that has not finished
 //   flow_send_event    — push an event into a waiting flow
 //   flow_status        — inspect a running/completed flow instance
 //   flow_list          — list all saved flow definitions in the workspace
@@ -158,6 +159,7 @@ interface PluginApi {
   config?: {
     plugins?: { entries?: Record<string, { config?: PluginConfig }> };
     gateway?: { port?: number; host?: string };
+    session?: { mainKey?: string };
     [key: string]: unknown;
   };
   runtime?: {
@@ -175,7 +177,9 @@ function register(api: PluginApi) {
   const rawCfg: PluginConfig =
     api.config?.plugins?.entries?.["clawflow"]?.config ?? {};
 
-  const pluginCfg: PluginConfig = { ...rawCfg };
+  // The host's main session key: an agent step that names only an agent runs
+  // in agent:<agent>:<mainKey>, which the flow_run guard must recognise.
+  const pluginCfg: PluginConfig = { ...rawCfg, sessionMainKey: api.config?.session?.mainKey };
 
   // Resolve workspace root once at registration time.
   // Try: env var → api.config.workspace → OpenClaw default → cwd()
@@ -884,6 +888,48 @@ You must pass the original flow definition back so the runner can continue.`,
             content: [
               { type: "text", text: JSON.stringify(runView(result)) },
             ],
+            details: result,
+          };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
+          };
+        }
+      },
+    },
+    { optional: true },
+  );
+
+  // ---- flow_cancel --------------------------------------------------------------
+
+  api.registerTool(
+    {
+      name: "flow_cancel",
+      description: `Cancel a flow run that has not finished.
+A running flow stops where it is: the step it is on is aborted (an agent step's turn is aborted too) and the run ends with status "cancelled". A run paused at an approval gate, or left "running" by a gateway restart, is marked cancelled.
+Use the instanceId from flow_run or flow_status. A finished run (completed, failed, cancelled) is left as it is.`,
+
+      parameters: {
+        type: "object",
+        required: ["instanceId"],
+        properties: {
+          instanceId: {
+            type: "string",
+            description: "The run to cancel, from flow_run or flow_status.",
+          },
+        },
+      },
+
+      async execute(_id: string, params: { instanceId: string }) {
+        try {
+          const result = await runner.cancel(params.instanceId, "Cancelled with flow_cancel");
+          return {
+            content: [{ type: "text", text: JSON.stringify(result) }],
             details: result,
           };
         } catch (err) {

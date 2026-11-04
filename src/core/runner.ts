@@ -38,6 +38,15 @@ import {
   type CustomStepDefinition,
   type StepRegistry,
 } from "./custom-steps.js";
+import {
+  liveRuns,
+  childController,
+  abortableDelay,
+  abortReason,
+  FlowCancelledError,
+  type LiveRun,
+} from "./active-runs.js";
+import type { FlowStatus } from "./types.js";
 
 // ---- Built-in AI providers ------------------------------------------------------
 // Selectable by name from an `ai` node's `provider` field (or cfg.defaultProvider).
@@ -111,12 +120,6 @@ export class FlowRunner {
   private cfg: PluginConfig;
   private store: StateStore;
   private registry: StepRegistry;
-  /**
-   * Per-flow AbortControllers. Lazily created in execCustomStep on first
-   * use so the same flow run sees the same signal across steps. When a
-   * flow-cancel API is wired in, it should call abort() and delete here.
-   */
-  private abortControllers = new Map<string, AbortController>();
 
   constructor(cfg: PluginConfig) {
     this.cfg = cfg;
@@ -255,7 +258,7 @@ export class FlowRunner {
       if (Object.keys(env).length > 0) state.env = env;
     }
 
-    return this.execute(flow, state, id, 0, []);
+    return this.executeRun(flow, state, id, 0, []);
   }
 
   // ---- Resume after approval ----------------------------------------------------
@@ -335,7 +338,104 @@ export class FlowRunner {
     });
 
     // Continue from the node AFTER the paused one, with preserved trace
-    return this.execute(flow, record.state, instanceId, pausedAtIndex + 1, storedTrace);
+    return this.executeRun(flow, record.state, instanceId, pausedAtIndex + 1, storedTrace);
+  }
+
+  // ---- Cancel -------------------------------------------------------------------
+
+  /**
+   * Cancel a run that has not finished.
+   *
+   * A run executing in this process is stopped where it is: the step it is on
+   * receives the abort and the run ends as cancelled before this resolves. An
+   * agent step's `openclaw agent` process gets SIGTERM, on which the CLI aborts
+   * the turn it started in the gateway; exec, http and ai steps are killed or
+   * aborted; a custom step gets `ctx.abortSignal` and is abandoned if it ignores
+   * it. Any other unfinished run (paused at an approval, or left running by a
+   * process that has since exited) is marked cancelled on its record. A runner
+   * in another process that still holds such a run stops before its next step
+   * and keeps that status.
+   */
+  async cancel(instanceId: string, reason = "Cancelled"): Promise<CancelResult> {
+    const live = liveRuns.get(instanceId);
+    const record = this.store.get(instanceId);
+    if (!live && !record) return { ok: false, instanceId, error: "not_found" };
+    if (!live && record && FINISHED_STATUSES.has(record.status)) {
+      return { ok: false, instanceId, error: "finished", status: record.status };
+    }
+
+    if (live) {
+      if (!live.controller.signal.aborted) live.controller.abort(new FlowCancelledError(reason));
+      // The step's work is raced against the abort, so the run settles at once;
+      // the bound only guards against a host that never yields.
+      let bound: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        live.done?.catch(() => undefined),
+        new Promise<void>((resolve) => {
+          bound = setTimeout(resolve, 5_000);
+        }),
+      ]);
+      clearTimeout(bound);
+      const status = this.store.get(instanceId)?.status ?? "cancelled";
+      return { ok: true, instanceId, status: status === "cancelled" ? "cancelled" : "cancelling" };
+    }
+
+    const current = record!;
+    const trace = current.trace ?? [];
+    const paused = trace.find((t) => t.status === "paused");
+    if (paused) paused.status = "cancelled";
+    if (current.resumeToken) this.store.resolveApproval(current.resumeToken);
+    this.store.update(instanceId, {
+      status: "cancelled",
+      error: reason,
+      trace,
+      running: undefined,
+      resumeToken: undefined,
+      waitingFor: undefined,
+      pausedAtIndex: undefined,
+    });
+    return { ok: true, instanceId, status: "cancelled" };
+  }
+
+  /** Execute a top-level run (new or resumed) as a live run of this process, so
+   *  cancel() can reach the step it is on. */
+  private async executeRun(
+    flow: FlowDefinition,
+    state: FlowState,
+    instanceId: string,
+    startIndex: number,
+    priorTrace: TraceEntry[],
+  ): Promise<FlowResult> {
+    const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
+    liveRuns.set(instanceId, live);
+    try {
+      const done = this.execute(flow, state, instanceId, startIndex, priorTrace, live.controller.signal);
+      live.done = done;
+      return await done;
+    } finally {
+      if (liveRuns.get(instanceId) === live) liveRuns.delete(instanceId);
+    }
+  }
+
+  /** End a run (or sub-flow) as cancelled, recording why. */
+  private endCancelled(
+    flow: FlowDefinition,
+    state: FlowState,
+    instanceId: string,
+    trace: TraceEntry[],
+    reason?: string,
+  ): FlowResult {
+    const error = reason || "Cancelled";
+    this.store.update(instanceId, { status: "cancelled", state, trace, error, running: undefined });
+    return { ok: false, status: "cancelled", flowName: flow.flow, instanceId, state, trace, error };
+  }
+
+  /** A top-level run whose record was marked cancelled from outside this
+   *  process while it ran. Sub-flow records are never marked that way. */
+  private cancelledOnRecord(instanceId: string): string | undefined {
+    if (instanceId.includes(":")) return undefined;
+    const record = this.store.get(instanceId);
+    return record?.status === "cancelled" ? (record.error || "Cancelled") : undefined;
   }
 
   // ---- Core execution loop ------------------------------------------------------
@@ -346,6 +446,7 @@ export class FlowRunner {
     instanceId: string,
     startIndex: number,
     priorTrace: TraceEntry[],
+    signal: AbortSignal,
   ): Promise<FlowResult> {
     const trace: TraceEntry[] = [...priorTrace];
     const nodes = flow.nodes;
@@ -355,8 +456,17 @@ export class FlowRunner {
       const node = nodes[i];
       const t0 = Date.now();
 
+      // One read per step: whether the run was cancelled, and the memo below.
+      const record = this.store.get(instanceId);
+      if (signal.aborted) return this.endCancelled(flow, state, instanceId, trace, abortReason(signal).message);
+      if (record?.status === "cancelled" && !instanceId.includes(":")) {
+        return this.endCancelled(flow, state, instanceId, trace, record.error);
+      }
+
       // ---- Durable memoization: skip already-completed nodes --------------------
-      const memo = this.store.getMemoized(instanceId, node.name);
+      const memo = record && Object.prototype.hasOwnProperty.call(record.completedNodes, node.name)
+        ? { found: true, output: record.completedNodes[node.name] }
+        : { found: false, output: undefined };
       if (memo.found) {
         if (node.output) state[node.output] = memo.output;
         // On resume, prior trace entries are already in priorTrace — don't re-add
@@ -376,7 +486,7 @@ export class FlowRunner {
       try {
         // Say what this run is doing while the step runs; each exit below clears it.
         this.store.update(instanceId, { running: this.runningStep(node, state) });
-        const result = await this.runWithRetry(node, state, flow, instanceId);
+        const result = await this.runWithRetry(node, state, flow, instanceId, signal);
 
         // ---- Paused for approval (do: wait, for: approval) ----------------------
         if (result.approve) {
@@ -434,6 +544,11 @@ export class FlowRunner {
         this.store.update(instanceId, { state, trace, running: undefined });
         i++;
       } catch (err) {
+        if (signal.aborted) {
+          const reason = abortReason(signal).message;
+          trace.push({ node: node.name, do: node.do, status: "cancelled", error: reason, durationMs: Date.now() - t0 });
+          return this.endCancelled(flow, state, instanceId, trace, reason);
+        }
         const message = err instanceof Error ? err.message : String(err);
         const entry: TraceEntry = {
           node: node.name,
@@ -443,6 +558,8 @@ export class FlowRunner {
           durationMs: Date.now() - t0,
         };
         trace.push(entry);
+        const cancelled = this.cancelledOnRecord(instanceId);
+        if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
         const error = `Node "${node.name}": ${message}`;
         this.store.update(instanceId, { status: "failed", state, trace, error, running: undefined });
         return {
@@ -457,6 +574,8 @@ export class FlowRunner {
       }
     }
 
+    const cancelled = this.cancelledOnRecord(instanceId);
+    if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
     this.store.update(instanceId, { status: "completed", state, trace });
     return {
       ok: true,
@@ -469,12 +588,18 @@ export class FlowRunner {
   }
 
   // ---- Retry wrapper ------------------------------------------------------------
+  // Each attempt gets its own signal, aborted when the run is cancelled (via
+  // `signal`) or when the attempt times out, so a timed-out attempt's child
+  // process or request is stopped before the next attempt starts instead of
+  // running on in the background. The work is raced against that signal, so a
+  // step that ignores it is abandoned, never waited on.
 
   private async runWithRetry(
     node: FlowNode,
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{
     output?: unknown;
     approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
@@ -486,37 +611,40 @@ export class FlowRunner {
     let lastError: Error = new Error("Unknown error");
 
     for (let attempt = 1; attempt <= policy.limit; attempt++) {
+      if (signal.aborted) throw abortReason(signal);
+      const { controller, dispose } = childController(signal);
+      const timer = setTimeout(
+        () => controller.abort(new Error(`Node "${node.name}" timed out after ${nodeTimeoutMs}ms`)),
+        nodeTimeoutMs,
+      );
       try {
-        const work = this.execNode(node, state, flow, instanceId);
-        const result = await Promise.race([
-          work,
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () =>
-                reject(
-                  new Error(
-                    `Node "${node.name}" timed out after ${nodeTimeoutMs}ms`,
-                  ),
-                ),
-              nodeTimeoutMs,
-            ),
-          ),
-        ]);
+        const stopped = new Promise<never>((_, reject) => {
+          const onAbort = () => reject(abortReason(controller.signal));
+          if (controller.signal.aborted) onAbort();
+          else controller.signal.addEventListener("abort", onAbort, { once: true });
+        });
+        const result = await Promise.race([this.execNode(node, state, flow, instanceId, controller.signal), stopped]);
         return { ...result, attempts: attempt };
       } catch (err) {
+        if (signal.aborted) throw abortReason(signal);
         lastError = err instanceof Error ? err : new Error(String(err));
         if (attempt < policy.limit) {
-          const delayMs = this.calcDelay(policy, attempt);
-          await new Promise((r) => setTimeout(r, delayMs));
+          await abortableDelay(this.calcDelay(policy, attempt), signal);
         }
+      } finally {
+        clearTimeout(timer);
+        dispose();
       }
     }
     throw lastError;
   }
 
-  /** How long one attempt of a step may run before it fails. */
+  /** How long one attempt of a step may run before it fails and is stopped.
+   *  An agent step defaults to the 120 s its `openclaw agent` process always
+   *  had: with 30 s here the step failed while its turn ran on in the gateway. */
   private nodeTimeoutMs(node: FlowNode): number {
-    return node.timeout ? parseDuration(node.timeout) : (this.cfg.maxNodeDurationMs ?? 30_000);
+    if (node.timeout) return parseDuration(node.timeout);
+    return this.cfg.maxNodeDurationMs ?? (node.do === "agent" ? 120_000 : 30_000);
   }
 
   private runningStep(node: FlowNode, state: FlowState): RunningStep {
@@ -529,7 +657,12 @@ export class FlowRunner {
     if (node.do === "agent") {
       // The same interpolation execNode applies, so this is the session the step runs in.
       const n = this.resolveNodeFields(node, state) as AgentNode;
-      step.target = { agent: n.agent ?? n.agentId, sessionKey: n.sessionKey ?? n.session, sessionId: n.sessionId };
+      const target = { agent: n.agent ?? n.agentId, sessionKey: n.sessionKey ?? n.session, sessionId: n.sessionId };
+      step.target = {
+        agent: target.agent,
+        sessionKey: agentStepSessionKey(target, this.cfg.defaultAgent, this.cfg.sessionMainKey),
+        sessionId: target.sessionId,
+      };
     }
     return step;
   }
@@ -549,6 +682,7 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{
     output?: unknown;
     approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
@@ -561,39 +695,41 @@ export class FlowRunner {
 
     switch (node.do) {
       case "ai":
-        return this.execAi(node as AiNode, state);
+        return this.execAi(node as AiNode, state, signal);
       case "agent":
-        return this.execAgent(node as AgentNode, state, instanceId);
+        return this.execAgent(node as AgentNode, state, instanceId, signal);
       case "branch":
-        return this.execBranch(node as BranchNode, state, flow, instanceId);
+        return this.execBranch(node as BranchNode, state, flow, instanceId, signal);
       case "condition":
         return this.execCondition(
           node as ConditionNode,
           state,
           flow,
           instanceId,
+          signal,
         );
       case "loop":
-        return this.execLoop(node as LoopNode, state, flow, instanceId);
+        return this.execLoop(node as LoopNode, state, flow, instanceId, signal);
       case "parallel":
         return this.execParallel(
           node as ParallelNode,
           state,
           flow,
           instanceId,
+          signal,
         );
       case "http":
-        return this.execHttp(node as HttpNode, state);
+        return this.execHttp(node as HttpNode, state, signal);
       case "memory":
         return this.execMemory(node as MemoryNode, state);
       case "wait":
-        return this.execWait(node as WaitNode, state, flow, instanceId);
+        return this.execWait(node as WaitNode, state, flow, instanceId, signal);
       case "sleep":
-        return this.execSleep(node as SleepNode);
+        return this.execSleep(node as SleepNode, signal);
       case "code":
         return this.execCode(node as CodeNode, state);
       case "exec":
-        return this.execExec(node as ExecNode, state);
+        return this.execExec(node as ExecNode, state, signal);
       default: {
         const stepName = (node as FlowNode & { do: string }).do;
         const def = this.registry.get(stepName);
@@ -604,7 +740,7 @@ export class FlowRunner {
             : " No custom steps are registered — is the plugin loaded?";
           throw new Error(`Unknown step type: "${stepName}".${hint}`);
         }
-        return this.execCustomStep(node, def, state, instanceId);
+        return this.execCustomStep(node, def, state, signal);
       }
     }
   }
@@ -614,6 +750,7 @@ export class FlowRunner {
   private async execAi(
     node: AiNode,
     state: FlowState,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     const provider = this.resolveProvider(node.provider);
     const model = this.resolveModel(node.model, provider);
@@ -642,7 +779,7 @@ export class FlowRunner {
       }
     }
 
-    const text = await this.callInference(model, system, userText, node.temperature, node.maxTokens, contentParts, provider);
+    const text = await this.callInference(model, system, userText, node.temperature, node.maxTokens, contentParts, provider, signal);
 
     if (node.schema) {
       const clean = text
@@ -824,6 +961,7 @@ export class FlowRunner {
     maxTokens?: number,
     content?: ContentPart[],
     provider?: ResolvedProvider | null,
+    signal?: AbortSignal,
   ): Promise<string> {
     // Optional override (used by tests and embedders)
     if (this.cfg.inferenceFn) {
@@ -834,10 +972,11 @@ export class FlowRunner {
         content,
         temperature: temperature ?? 0,
         maxTokens,
+        signal,
       });
       return result.text;
     }
-    return this.callDirectApi(model, system, prompt, temperature, maxTokens, content, provider);
+    return this.callDirectApi(model, system, prompt, temperature, maxTokens, content, provider, signal);
   }
 
   private async callDirectApi(
@@ -848,6 +987,7 @@ export class FlowRunner {
     maxTokens?: number,
     content?: ContentPart[],
     provider?: ResolvedProvider | null,
+    signal?: AbortSignal,
   ): Promise<string> {
     // A selected provider is the single credential/routing path — no env racing.
     if (provider) {
@@ -861,6 +1001,7 @@ export class FlowRunner {
           temperature,
           maxTokens,
           content,
+          signal,
         );
       }
       return this.callOpenAiCompatible(
@@ -873,6 +1014,7 @@ export class FlowRunner {
         provider.name,
         maxTokens,
         content,
+        signal,
       );
     }
 
@@ -895,6 +1037,7 @@ export class FlowRunner {
         "OpenRouter",
         maxTokens,
         content,
+        signal,
       );
     }
 
@@ -908,6 +1051,7 @@ export class FlowRunner {
         temperature,
         maxTokens,
         content,
+        signal,
       );
     }
 
@@ -922,6 +1066,7 @@ export class FlowRunner {
         "OpenAI",
         maxTokens,
         content,
+        signal,
       );
     }
 
@@ -943,6 +1088,7 @@ export class FlowRunner {
     temperature?: number,
     maxTokens?: number,
     content?: ContentPart[],
+    signal?: AbortSignal,
   ): Promise<string> {
     // Convert content parts to Anthropic format when multimodal
     const userContent = content ? this.toAnthropicContent(content) : prompt;
@@ -961,6 +1107,7 @@ export class FlowRunner {
         system,
         messages: [{ role: "user", content: userContent }],
       }),
+      signal,
     });
     if (!resp.ok)
       throw new Error(`Anthropic API ${resp.status}: ${await resp.text()}`);
@@ -980,6 +1127,7 @@ export class FlowRunner {
     provider: string,
     maxTokens?: number,
     content?: ContentPart[],
+    signal?: AbortSignal,
   ): Promise<string> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -1001,6 +1149,7 @@ export class FlowRunner {
           { role: "user", content: content ?? prompt },
         ],
       }),
+      signal,
     });
     if (!resp.ok)
       throw new Error(`${provider} API ${resp.status}: ${await resp.text()}`);
@@ -1018,6 +1167,7 @@ export class FlowRunner {
     node: AgentNode,
     state: FlowState,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     const task = node.task; // template already interpolated by resolveNodeFields
     const input = node.input ? this.getPath(state, node.input) : undefined;
@@ -1037,8 +1187,10 @@ export class FlowRunner {
       sessionId: node.sessionId,
       channel: node.channel,
     };
-    const caller = this.callers.get(instanceId);
-    if (caller && targetsCallerSession(target, caller, this.cfg.defaultAgent)) {
+    // Sub-flow ids extend the run's id ("<id>:loop:…"), and the caller is
+    // recorded against the run.
+    const caller = this.callers.get(instanceId.split(":")[0]);
+    if (caller && targetsCallerSession(target, caller, this.cfg.defaultAgent, this.cfg.sessionMainKey)) {
       throw new Error(
         `This step runs in the same session as the agent that started this flow with flow_run. ` +
           `That session is busy until flow_run returns, so the step could never start and would wait until it timed out. ` +
@@ -1046,7 +1198,7 @@ export class FlowRunner {
       );
     }
 
-    const cliResult = await this.tryOpenClawAgent(fullPrompt, target, state, timeoutMs);
+    const cliResult = await this.tryOpenClawAgent(fullPrompt, target, state, timeoutMs, signal);
     return { output: this.autoParseJson(cliResult) };
   }
 
@@ -1082,6 +1234,7 @@ export class FlowRunner {
     target: { agent?: string; sessionKey?: string; sessionId?: string; channel?: string },
     state: FlowState,
     nodeTimeoutMs?: number,
+    signal?: AbortSignal,
   ): Promise<string> {
     const { execFile } = await import("child_process");
     const { promisify } = await import("util");
@@ -1094,6 +1247,7 @@ export class FlowRunner {
       throw new Error("openclaw CLI not found — agent nodes require the openclaw CLI to be installed");
     }
 
+    if (signal?.aborted) throw abortReason(signal);
     const args = ["agent", ...this.buildAgentArgs(target), "--message", message];
 
     // Merge flow-level env vars (state.env) into the child process environment.
@@ -1105,13 +1259,19 @@ export class FlowRunner {
     };
 
     try {
+      // On abort (the run is cancelled or the attempt timed out) the child gets
+      // SIGTERM, Node's default kill signal. The openclaw CLI answers SIGTERM by
+      // sending chat.abort for the turn it started, so the turn stops in the
+      // gateway too instead of running on (or staying queued) without the flow.
       const { stdout } = await execFileAsync("openclaw", args, {
         timeout: nodeTimeoutMs ?? this.cfg.maxNodeDurationMs ?? 120_000,
         maxBuffer: 10 * 1024 * 1024, // 10MB
         env,
+        signal,
       });
       return stdout.trim();
     } catch (err) {
+      if (signal?.aborted) throw abortReason(signal);
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`openclaw agent failed: ${msg}`);
     }
@@ -1190,6 +1350,7 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     // Strip {{ }} template wrapper if present so both "check.flag" and "{{ check.flag }}" work
     const onPath = node.on.replace(/^\{\{\s*([\w.\[\]0-9]+)\s*\}\}$/, "$1");
@@ -1212,7 +1373,7 @@ export class FlowRunner {
     };
     const subId = `${instanceId}:branch:${node.name}:${pathName}`;
     this.store.create(subId, subFlow.flow, state);
-    const subResult = await this.execute(subFlow, state, subId, 0, []);
+    const subResult = await this.execute(subFlow, state, subId, 0, [], signal);
     if (!subResult.ok) {
       throw new Error(
         `branch "${node.name}" path "${pathName}" failed: ${subResult.error}`,
@@ -1231,6 +1392,7 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     // Strip {{ }} template wrapper if present so both "check.skip" and "{{ check.skip }}" work
     const condExpr = node.if.replace(/\{\{\s*(.*?)\s*\}\}/g, "$1");
@@ -1249,7 +1411,7 @@ export class FlowRunner {
     };
     const subId = `${instanceId}:condition:${node.name}:${branchName}`;
     this.store.create(subId, subFlow.flow, state);
-    const subResult = await this.execute(subFlow, state, subId, 0, []);
+    const subResult = await this.execute(subFlow, state, subId, 0, [], signal);
     if (!subResult.ok) {
       throw new Error(
         `condition "${node.name}" ${branchName} branch failed: ${subResult.error}`,
@@ -1301,6 +1463,7 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{ output: unknown[] }> {
     // Support both plain dotted paths ("plan.sections") and template syntax ("{{ plan.sections }}")
     const resolved = this.resolveBodyObject(node.over, state);
@@ -1323,6 +1486,7 @@ export class FlowRunner {
         subId,
         0,
         [],
+        signal,
       );
       if (!subResult.ok)
         throw new Error(`loop iteration failed: ${subResult.error}`);
@@ -1340,6 +1504,7 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     const promises = node.nodes.map(async (subNode, idx) => {
       const branchState: FlowState = JSON.parse(JSON.stringify(state));
@@ -1355,6 +1520,7 @@ export class FlowRunner {
         subId,
         0,
         [],
+        signal,
       );
       if (!subResult.ok)
         throw new Error(
@@ -1388,6 +1554,7 @@ export class FlowRunner {
   private async execHttp(
     node: HttpNode,
     state: FlowState,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     const url = node.url; // template already interpolated by resolveNodeFields
     const method = node.method ?? "GET";
@@ -1408,7 +1575,7 @@ export class FlowRunner {
       // values already interpolated by resolveNodeFields (templateEach)
       Object.assign(headers, node.headers);
     }
-    const resp = await fetch(url, { method, headers, body });
+    const resp = await fetch(url, { method, headers, body, signal });
     const text = await resp.text();
     try {
       return { output: JSON.parse(text) };
@@ -1423,7 +1590,7 @@ export class FlowRunner {
     node: FlowNode,
     def: CustomStepDefinition,
     state: FlowState,
-    instanceId: string,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     // Build the input view: every declared field, with templates pre-resolved
     // (mirrors do: http for url/body/headers). Non-string scalars pass through.
@@ -1433,14 +1600,6 @@ export class FlowRunner {
       const value = raw[field];
       if (value === undefined) continue;
       input[field] = this.resolveBodyObject(value, state);
-    }
-
-    // Lazily create a per-flow AbortController. Same signal across all custom
-    // steps in the run, so cancelling the flow aborts every in-flight step.
-    let controller = this.abortControllers.get(instanceId);
-    if (!controller) {
-      controller = new AbortController();
-      this.abortControllers.set(instanceId, controller);
     }
 
     const env = (state.env && typeof state.env === "object")
@@ -1456,7 +1615,8 @@ export class FlowRunner {
         warn: (msg, ...rest) => console.warn(logPrefix, msg, ...rest),
         error: (msg, ...rest) => console.error(logPrefix, msg, ...rest),
       },
-      abortSignal: controller.signal,
+      // Aborts when the run is cancelled or this attempt times out.
+      abortSignal: signal,
       nodeName: node.name,
       resolveTemplate: (template: string) => this.resolveTemplate(template, state),
     };
@@ -1512,6 +1672,7 @@ export class FlowRunner {
     state: FlowState,
     flow: FlowDefinition,
     instanceId: string,
+    signal: AbortSignal,
   ): Promise<{
     output?: unknown;
     pause?: boolean;
@@ -1560,20 +1721,35 @@ export class FlowRunner {
         : 24 * 3_600_000; // 24h default
 
       const payload = await new Promise<unknown>((resolve, reject) => {
+        // Cancelling the run (or this attempt timing out) drops the waiter.
+        const onAbort = () => {
+          clearTimeout(timeoutHandle);
+          eventBus.get(instanceId)?.delete(eventType);
+          reject(abortReason(signal));
+        };
         const timeoutHandle = setTimeout(
-          () =>
+          () => {
+            signal.removeEventListener("abort", onAbort);
             reject(
               new Error(
                 `wait "${node.name}" timed out waiting for event "${eventType}"`,
               ),
-            ),
+            );
+          },
           timeoutMs,
         );
         if (!eventBus.has(instanceId))
           eventBus.set(instanceId, new Map());
-        eventBus
-          .get(instanceId)!
-          .set(eventType, { resolve, reject, timeoutHandle });
+        eventBus.get(instanceId)!.set(eventType, {
+          resolve: (value) => {
+            signal.removeEventListener("abort", onAbort);
+            resolve(value);
+          },
+          reject,
+          timeoutHandle,
+        });
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
       });
 
       eventBus.get(instanceId)?.delete(eventType);
@@ -1585,9 +1761,8 @@ export class FlowRunner {
 
   // ---- do: sleep ----------------------------------------------------------------
 
-  private async execSleep(node: SleepNode): Promise<{ output: null }> {
-    const ms = parseDuration(node.duration);
-    await new Promise((r) => setTimeout(r, ms));
+  private async execSleep(node: SleepNode, signal: AbortSignal): Promise<{ output: null }> {
+    await abortableDelay(parseDuration(node.duration), signal);
     return { output: null };
   }
 
@@ -1785,6 +1960,7 @@ export class FlowRunner {
   private async execExec(
     node: ExecNode,
     state: FlowState,
+    signal: AbortSignal,
   ): Promise<{ output: unknown }> {
     const { exec } = await import("child_process");
     const { promisify } = await import("util");
@@ -1801,11 +1977,14 @@ export class FlowRunner {
           : (this.cfg.maxNodeDurationMs ?? 30_000),
         maxBuffer: 10 * 1024 * 1024, // 10MB
         cwd,
+        // On abort the shell gets SIGTERM, as on its own timeout.
+        signal,
       });
       return {
         output: { stdout: stdout.trimEnd(), stderr: stderr.trimEnd(), exitCode: 0 },
       };
     } catch (err: unknown) {
+      if (signal.aborted) throw abortReason(signal);
       const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
       // Non-zero exit is not a runtime error — return the result with exitCode
       if (e.code != null && e.stdout !== undefined) {
@@ -2062,20 +2241,45 @@ export interface CallerSession {
   sessionId?: string;
 }
 
-/** Whether an agent step's resolved target is the caller's own session. Keys
- *  are compared the way OpenClaw canonicalises them (session-store-key.ts,
- *  canonicalizeSessionKeyForAgent): lower-cased, then a key without the
- *  `agent:` prefix is scoped by the step's agent. A step that names only an
- *  agent runs in that agent's default session, which is not resolved here, so
- *  it is not caught. */
+/** The session key an agent step's turn runs in, resolved the way OpenClaw
+ *  routes `openclaw agent`. Keys are lower-cased, and a key without the
+ *  `agent:` prefix is scoped by the step's agent (session-store-key.ts,
+ *  canonicalizeSessionKeyForAgent). A step with neither a key nor a session id
+ *  runs in its agent's main session, `agent:<agent>:<session.mainKey>`, the
+ *  main key defaulting to "main" (agent-request-routing.ts →
+ *  resolveExplicitAgentSessionKey). Undefined for a step that names only a
+ *  session id, which is matched by id instead. */
+export function agentStepSessionKey(
+  target: { agent?: string; sessionKey?: string; sessionId?: string },
+  defaultAgent?: string,
+  mainKey?: string,
+): string | undefined {
+  const agent = (target.agent ?? defaultAgent ?? "main").toLowerCase();
+  if (target.sessionKey) {
+    const raw = target.sessionKey.toLowerCase();
+    return raw.startsWith("agent:") ? raw : `agent:${agent}:${raw}`;
+  }
+  if (target.sessionId) return undefined;
+  return `agent:${agent}:${(mainKey || "main").toLowerCase()}`;
+}
+
+/** Whether an agent step's resolved target is the caller's own session. */
 export function targetsCallerSession(
   target: { agent?: string; sessionKey?: string; sessionId?: string },
   caller: CallerSession,
   defaultAgent?: string,
+  mainKey?: string,
 ): boolean {
   if (target.sessionId && caller.sessionId && target.sessionId === caller.sessionId) return true;
-  if (!target.sessionKey || !caller.sessionKey) return false;
-  const raw = target.sessionKey.toLowerCase();
-  const key = raw.startsWith("agent:") ? raw : `agent:${(target.agent ?? defaultAgent ?? "main").toLowerCase()}:${raw}`;
-  return key === caller.sessionKey.toLowerCase();
+  const key = agentStepSessionKey(target, defaultAgent, mainKey);
+  return Boolean(key && caller.sessionKey) && key === caller.sessionKey!.toLowerCase();
 }
+
+/** What cancel() did. "cancelling" means the run was aborted but had not ended
+ *  within the bound (a host that never yields); it ends as cancelled. */
+export type CancelResult =
+  | { ok: true; instanceId: string; status: "cancelled" | "cancelling" }
+  | { ok: false; instanceId: string; error: "not_found" }
+  | { ok: false; instanceId: string; error: "finished"; status: FlowStatus };
+
+const FINISHED_STATUSES = new Set<string>(["completed", "failed", "cancelled"]);
