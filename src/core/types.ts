@@ -401,7 +401,8 @@ export type NodeStatus =
   | "error"
   | "skipped"
   | "waiting"
-  | "paused";
+  | "paused"
+  | "cancelled"; // the step was running when the run was cancelled
 
 export interface TraceEntry {
   node: string;
@@ -488,6 +489,8 @@ export interface InferenceRequest {
   content?: ContentPart[];
   temperature?: number;
   maxTokens?: number;
+  /** Aborts when the run is cancelled or the step's attempt times out. */
+  signal?: AbortSignal;
 }
 
 export interface InferenceResult {
@@ -556,6 +559,12 @@ export interface PluginConfig {
   inferenceFn?: InferenceFn;
   /** OpenClaw agent ID for do:agent nodes (e.g. "ops"). Falls back to --local if unset. */
   defaultAgent?: string;
+  /**
+   * The host's `session.mainKey`. An agent step that names only an agent runs
+   * in `agent:<agent>:<mainKey>` ("main" when unset). Set by the OpenClaw
+   * plugin from the host config, not by plugin config.
+   */
+  sessionMainKey?: string;
   /** Optional HTTP server config — exposes a generic run endpoint per flow. */
   serve?: ServeConfig;
   /**

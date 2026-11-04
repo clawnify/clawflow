@@ -14,6 +14,7 @@ import { resolveRunnableFlow } from "./manage.js";
 //
 // Endpoints:
 //   POST /:basePath/:flowName/run  — run a flow with the JSON body as inputs
+//   POST /:basePath/runs/:id/cancel: cancel a run that has not finished
 //   POST /:basePath/validate       — statically validate a flow definition
 //   GET  /:basePath/health         — health check
 
@@ -311,6 +312,42 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
         // Everything that throws here is a client-side problem: a schedule the
         // validator rejects, a duplicate id, a record that vanished mid-request.
         json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // Cancel a run: POST /:basePath/runs/:instanceId/cancel { reason? }
+    // A run executing in this process stops where it is; a paused run, or one
+    // a restart left "running", is marked cancelled (FlowRunner.cancel).
+    const cancelPattern = new RegExp(
+      `^${basePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/runs/([a-zA-Z0-9_-]+)/cancel$`,
+    );
+    const cancelMatch = pathname.match(cancelPattern);
+    if (cancelMatch && req.method === "POST") {
+      try {
+        let reason = "Cancelled";
+        const rawBody = await readBody(req);
+        if (rawBody) {
+          try {
+            const body = JSON.parse(rawBody) as { reason?: unknown };
+            if (typeof body?.reason === "string" && body.reason.trim()) reason = body.reason.trim().slice(0, 200);
+          } catch {
+            json(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+        }
+        const result = await runner.cancel(cancelMatch[1], reason);
+        if (result.ok) {
+          log.info(`[clawflow] run ${result.instanceId} ${result.status} via http`);
+          json(res, 200, result);
+        } else if (result.error === "not_found") {
+          json(res, 404, { error: `Run not found: ${result.instanceId}`, code: "run_not_found" });
+        } else {
+          json(res, 409, { error: `Run already ${result.status}`, code: "run_finished", status: result.status });
+        }
+      } catch (err) {
+        log.error(`[clawflow] cancel error: ${err instanceof Error ? err.message : String(err)}`);
+        json(res, 500, { error: "Internal server error" });
       }
       return;
     }

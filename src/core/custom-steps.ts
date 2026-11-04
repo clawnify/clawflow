@@ -46,7 +46,7 @@ export interface CustomStepContext {
     warn: (msg: string, ...rest: unknown[]) => void;
     error: (msg: string, ...rest: unknown[]) => void;
   };
-  /** Aborts when the flow is cancelled. Custom steps should pass this to fetch()/etc. */
+  /** Aborts when the flow is cancelled or this attempt of the step times out. Pass it to fetch()/etc.; a step that ignores it is abandoned. */
   readonly abortSignal: AbortSignal;
   /** The node's `name` field — useful for log prefixing or error messages. */
   readonly nodeName: string;

@@ -56,7 +56,7 @@ A flow is JSON with a `flow` name, an optional `env` block, and a `nodes` array.
 - Set `agent: "clawflow"` on agent nodes to target a configured OpenClaw agent (a plain slug like `main`/`clawflow`, never a session key)
 - Set `sessionKey: "agent:main:slack:channel:agent"` on agent nodes to run inside a specific existing session (e.g. a channel) — maps to `--session-key`. An `agent:`-prefixed key is self-scoping; a bare key (e.g. `incident-42`) is scoped by `agent`. May be combined with `agent`
 - Set `sessionId: "sess-9"` to target one explicit session by id (maps to `--session-id`) — the most specific selector, scoped by `agent`. Use `sessionKey` for channel/self-scoping keys, `sessionId` to resume a known id
-- An agent step that targets a session waits for that session to be free: its turn queues behind any turn already running there. Never `flow_run` such a flow from the session it targets. `flow_run` keeps your turn busy until the flow ends, so the step could never start; the runner fails it at once to say so. Test it by firing its real trigger while that session is idle
+- An agent step that targets a session waits for that session to be free: its turn queues behind any turn already running there. Never `flow_run` such a flow from the session it targets. `flow_run` keeps your turn busy until the flow ends, so the step could never start; the runner fails it at once to say so. Test it by firing its real trigger while that session is idle. A step that names only an `agent` runs in that agent's main session (`agent:<agent>:main`), so the same applies to it
 - Set `channel: "slack"` to deliver the agent's reply on a specific channel (maps to `--channel`); omit to use the session's own channel
 - `agent`, `sessionKey`, `sessionId`, and `channel` all support templates, so a prior node can compute the target (e.g. `agent: "{{ route.slug }}"`)
 - Use `do: wait` with `for: approval` before any side effects that need human review — it pauses the flow, provides a token, and shows preview data to the approver
@@ -672,4 +672,5 @@ Every edit is validated after it applies; if validation fails the edit is reject
 | `flow_edit` | Edit a flow: set top-level fields, modify nodes (update, add, remove, move, wrap, revert, list). Use `parent` for nested targets (e.g. `"myBranch/true"`, `"myLoop"`). Use `wrap` to wrap nodes into containers. |
 | `flow_resume` | Resume a paused flow after approval (`instanceId`, `approved: true/false`, `flow`) |
 | `flow_send_event` | Push an event into a waiting flow (`instanceId`, `eventType`, `payload`) |
+| `flow_cancel` | Cancel a run that has not finished (`instanceId`): the step it is on is stopped, an agent step's turn too, and the run ends `cancelled` |
 | `flow_status` | Check status of a flow instance or list all instances |

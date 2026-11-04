@@ -572,6 +572,8 @@ Every flow run gets a unique `instanceId`. The runner persists state after every
 
 **Retention.** Finished runs (completed, failed, cancelled) are deleted 30 days after their last update, together with their loop and branch instance files, by a daily sweep in the gateway process. Set `runRetentionDays` in the plugin config to change it; `0` keeps every run. Running, paused and waiting runs are never deleted.
 
+**Cancelling a run.** `flow_cancel { instanceId }`, or `POST /flows/runs/:instanceId/cancel` on the flow server (optional body `{ "reason": "..." }`), stops a run that has not finished. A run executing in the process stops on the step it is on: an agent step's `openclaw agent` process gets SIGTERM, on which the CLI aborts its turn in the gateway; exec, http and ai steps are killed or aborted; a custom step gets `ctx.abortSignal` and is abandoned if it ignores it. The run ends with status `cancelled`, the interrupted step's trace entry too, and nothing after it runs. A run paused at an approval gate, or left `running` by a restart, is marked cancelled and its approval dropped; a runner in another process that still holds a run stops before its next step. The route answers 404 (`run_not_found`) for an unknown run and 409 (`run_finished`) for a finished one. Each attempt of a step is stopped the same way when it times out, before any retry starts; an agent step with no `timeout` gets 120 s per attempt.
+
 **Reading runs.** `flow_status` lists runs newest first, 20 per page (`limit`, then `cursor` from the previous page). One run comes back whole when it is small, and otherwise as a summary: status, error, each state key with its size, and the trace without outputs. Read any single value with `path`, e.g. `state.leads` or `trace.3.output`; arrays and long strings come back a page at a time (`offset`, `limit`). `flow_run` and `flow_resume` return the same summary when a run is too large to read in one tool result. The same functions (`listRuns`, `summarizeRun`, `readRunValue`, `sweepRuns`) are exported for other hosts. A small summary of each run is kept in `flow-state/_index/`, so a list reads a few hundred bytes per run instead of parsing every record; an entry older than its record is ignored, and the daily sweep fills in missing ones.
 
 This is the lightweight equivalent of Cloudflare Durable Objects' memoization. Cloudflare does it at the infrastructure level with global durability. We do it at the file system level for local/self-hosted use.
@@ -584,7 +586,7 @@ The format is the spec. The runtime is swappable.
 
 ### 1. OpenClaw Plugin (current)
 
-Eleven tools registered in OpenClaw:
+Thirteen tools registered in OpenClaw:
 
 | Tool | Does |
 |---|---|
@@ -594,6 +596,7 @@ Eleven tools registered in OpenClaw:
 | `flow_run` | Execute a flow (uses latest published version by default) |
 | `flow_resume` | Resume after an approval gate |
 | `flow_send_event` | Push an event into a waiting flow |
+| `flow_cancel` | Cancel a run that has not finished: the step it is on is stopped (an agent step's turn too) |
 | `flow_status` | List instances a page at a time, or inspect one (a summary when large, one value by `path`) |
 | `flow_list` | List all flows with metadata, expected inputs, and version info |
 | `flow_read` | Read a flow definition (draft or specific version), inspect single nodes |
@@ -615,7 +618,7 @@ Eleven tools registered in OpenClaw:
   "agents": {
     "list": [{
       "id": "main",
-      "tools": { "alsoAllow": ["flow_create", "flow_delete", "flow_restore_from_bin", "flow_run", "flow_resume", "flow_send_event", "flow_status", "flow_list", "flow_read", "flow_publish", "flow_edit", "flow_trigger"] }
+      "tools": { "alsoAllow": ["flow_create", "flow_delete", "flow_restore_from_bin", "flow_run", "flow_resume", "flow_cancel", "flow_send_event", "flow_status", "flow_list", "flow_read", "flow_publish", "flow_edit", "flow_trigger"] }
     }]
   }
 }
