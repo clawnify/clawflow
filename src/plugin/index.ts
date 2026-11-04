@@ -142,8 +142,11 @@ type RequireApprovalDecision = {
   timeoutBehavior?: "allow" | "deny";
 };
 
+/** The per-call context OpenClaw hands a tool factory (OpenClawPluginToolContext). */
+type ToolContext = { sessionKey?: string; sessionId?: string };
+
 interface PluginApi {
-  registerTool: (def: object, opts?: { optional?: boolean }) => void;
+  registerTool: (def: object | ((ctx?: ToolContext) => object), opts?: { name?: string; optional?: boolean }) => void;
   registerHook?: (
     events: string | string[],
     handler: (event: BeforeToolCallEvent) =>
@@ -648,7 +651,10 @@ directory. If the flow file already exists, the restore is rejected.`,
   // ---- flow_run -----------------------------------------------------------------
 
   api.registerTool(
-    {
+    // A factory, so the tool knows which session called it: flow_run blocks
+    // that session until the flow ends, and the runner refuses an agent step
+    // that targets it instead of letting the step wait until it times out.
+    (ctx?: ToolContext) => ({
       name: "flow_run",
       catalogMode: "direct-only",
       description: `Run an agentic workflow in the clawflow format.
@@ -799,7 +805,9 @@ Set version to run a specific published version.`,
         }
 
         try {
-          const result = await runner.run(flowDef, params.input ?? {});
+          const result = await runner.run(flowDef, params.input ?? {}, undefined, {
+            caller: { sessionKey: ctx?.sessionKey, sessionId: ctx?.sessionId },
+          });
           const out = { ...result, _source: source };
           // Whole when it fits, else a summary the agent reads on from with
           // flow_status { instanceId, path } (see core/runs.ts).
@@ -820,8 +828,8 @@ Set version to run a specific published version.`,
           };
         }
       },
-    },
-    { optional: true },
+    }),
+    { name: "flow_run", optional: true },
   );
 
   // ---- flow_resume --------------------------------------------------------------
