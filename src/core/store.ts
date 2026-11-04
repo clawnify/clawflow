@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { FlowState, FlowResult, TraceEntry, PendingApproval } from "./types.js";
+import type { FlowState, FlowResult, TraceEntry, PendingApproval, RunningStep } from "./types.js";
 
 // ---- Durable State Store --------------------------------------------------------
 // Persists flow instance state to disk so flows survive gateway restarts.
@@ -22,6 +22,7 @@ export interface InstanceRecord {
   state: FlowState;
   completedNodes: Record<string, unknown>; // nodeName -> output (memoized)
   trace: TraceEntry[]; // persisted trace survives resume
+  running?: RunningStep; // the step executing now; cleared when it ends
   pausedAtIndex?: number; // node index where flow paused (for resume)
   resumeToken?: string;
   waitingFor?: FlowResult["waitingFor"];

@@ -8,6 +8,7 @@ import {
   FlowState,
   FlowResult,
   TraceEntry,
+  RunningStep,
   PluginConfig,
   MODEL_MAP,
   OPENROUTER_MODEL_MAP,
@@ -352,6 +353,8 @@ export class FlowRunner {
       }
 
       try {
+        // Say what this run is doing while the step runs; each exit below clears it.
+        this.store.update(instanceId, { running: this.runningStep(node, state) });
         const result = await this.runWithRetry(node, state, flow, instanceId);
 
         // ---- Paused for approval (do: wait, for: approval) ----------------------
@@ -367,6 +370,7 @@ export class FlowRunner {
             status: "paused",
             state,
             trace,
+            running: undefined,
             pausedAtIndex: i,
             resumeToken: result.approve.token,
             waitingFor: {
@@ -406,7 +410,7 @@ export class FlowRunner {
           durationMs: Date.now() - t0,
         };
         trace.push(entry);
-        this.store.update(instanceId, { state, trace });
+        this.store.update(instanceId, { state, trace, running: undefined });
         i++;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -419,7 +423,7 @@ export class FlowRunner {
         };
         trace.push(entry);
         const error = `Node "${node.name}": ${message}`;
-        this.store.update(instanceId, { status: "failed", state, trace, error });
+        this.store.update(instanceId, { status: "failed", state, trace, error, running: undefined });
         return {
           ok: false,
           status: "failed",
@@ -456,9 +460,7 @@ export class FlowRunner {
     attempts?: number;
   }> {
     const policy: RetryPolicy = node.retry ?? { limit: 1, delay: 0 };
-    const nodeTimeoutMs = node.timeout
-      ? parseDuration(node.timeout)
-      : (this.cfg.maxNodeDurationMs ?? 30_000);
+    const nodeTimeoutMs = this.nodeTimeoutMs(node);
 
     let lastError: Error = new Error("Unknown error");
 
@@ -489,6 +491,26 @@ export class FlowRunner {
       }
     }
     throw lastError;
+  }
+
+  /** How long one attempt of a step may run before it fails. */
+  private nodeTimeoutMs(node: FlowNode): number {
+    return node.timeout ? parseDuration(node.timeout) : (this.cfg.maxNodeDurationMs ?? 30_000);
+  }
+
+  private runningStep(node: FlowNode, state: FlowState): RunningStep {
+    const step: RunningStep = {
+      node: node.name,
+      do: node.do,
+      startedAt: new Date().toISOString(),
+      timeoutMs: this.nodeTimeoutMs(node),
+    };
+    if (node.do === "agent") {
+      // The same interpolation execNode applies, so this is the session the step runs in.
+      const n = this.resolveNodeFields(node, state) as AgentNode;
+      step.target = { agent: n.agent ?? n.agentId, sessionKey: n.sessionKey ?? n.session, sessionId: n.sessionId };
+    }
+    return step;
   }
 
   private calcDelay(policy: RetryPolicy, attempt: number): number {
