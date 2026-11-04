@@ -5,7 +5,8 @@
 // standalone consumers (e.g. `@clawnify/clawflow` as a Cloudflare runtime).
 export { default } from "./plugin/index.js";
 
-export { FlowRunner, sendEvent } from "./core/runner.js";
+export { FlowRunner, sendEvent, targetsCallerSession } from "./core/runner.js";
+export type { CallerSession } from "./core/runner.js";
 export { StateStore } from "./core/store.js";
 export { transpileToCloudflare } from "./core/transpile.js";
 export { validateFlow } from "./core/validate.js";

@@ -125,7 +125,28 @@ export class FlowRunner {
 
   // ---- Start a new run ----------------------------------------------------------
 
+  /** The agent session that started a run and is waiting on it (flow_run).
+   *  An agent step targeting that session could only start once the waiting
+   *  turn ends, so the run would deadlock until the step times out. */
+  private callers = new Map<string, CallerSession>();
+
   async run(
+    flow: FlowDefinition,
+    input: unknown,
+    instanceId?: string,
+    opts?: { caller?: CallerSession },
+  ): Promise<FlowResult> {
+    if (!opts?.caller?.sessionKey && !opts?.caller?.sessionId) return this.runFlow(flow, input, instanceId);
+    const id = instanceId ?? crypto.randomUUID();
+    this.callers.set(id, opts.caller);
+    try {
+      return await this.runFlow(flow, input, id);
+    } finally {
+      this.callers.delete(id);
+    }
+  }
+
+  private async runFlow(
     flow: FlowDefinition,
     input: unknown,
     instanceId?: string,
@@ -520,7 +541,7 @@ export class FlowRunner {
       case "ai":
         return this.execAi(node as AiNode, state);
       case "agent":
-        return this.execAgent(node as AgentNode, state);
+        return this.execAgent(node as AgentNode, state, instanceId);
       case "branch":
         return this.execBranch(node as BranchNode, state, flow, instanceId);
       case "condition":
@@ -974,6 +995,7 @@ export class FlowRunner {
   private async execAgent(
     node: AgentNode,
     state: FlowState,
+    instanceId: string,
   ): Promise<{ output: unknown }> {
     const task = node.task; // template already interpolated by resolveNodeFields
     const input = node.input ? this.getPath(state, node.input) : undefined;
@@ -986,18 +1008,23 @@ export class FlowRunner {
       ? parseDuration(node.timeout)
       : undefined;
 
-    const cliResult = await this.tryOpenClawAgent(
-      fullPrompt,
-      {
-        // new names win; agentId/session are accepted as deprecated aliases
-        agent: node.agent ?? node.agentId,
-        sessionKey: node.sessionKey ?? node.session,
-        sessionId: node.sessionId,
-        channel: node.channel,
-      },
-      state,
-      timeoutMs,
-    );
+    const target = {
+      // new names win; agentId/session are accepted as deprecated aliases
+      agent: node.agent ?? node.agentId,
+      sessionKey: node.sessionKey ?? node.session,
+      sessionId: node.sessionId,
+      channel: node.channel,
+    };
+    const caller = this.callers.get(instanceId);
+    if (caller && targetsCallerSession(target, caller, this.cfg.defaultAgent)) {
+      throw new Error(
+        `This step runs in the same session as the agent that started this flow with flow_run. ` +
+          `That session is busy until flow_run returns, so the step could never start and would wait until it timed out. ` +
+          `Test the flow by triggering it for real while that session is idle, or point the step at another session.`,
+      );
+    }
+
+    const cliResult = await this.tryOpenClawAgent(fullPrompt, target, state, timeoutMs);
     return { output: this.autoParseJson(cliResult) };
   }
 
@@ -2005,4 +2032,28 @@ export class FlowRunner {
   listApprovals() {
     return this.store.listApprovals();
   }
+}
+
+/** The OpenClaw session a run was started from (the flow_run tool's caller). */
+export interface CallerSession {
+  sessionKey?: string;
+  sessionId?: string;
+}
+
+/** Whether an agent step's resolved target is the caller's own session. Keys
+ *  are compared the way OpenClaw canonicalises them (session-store-key.ts,
+ *  canonicalizeSessionKeyForAgent): lower-cased, then a key without the
+ *  `agent:` prefix is scoped by the step's agent. A step that names only an
+ *  agent runs in that agent's default session, which is not resolved here, so
+ *  it is not caught. */
+export function targetsCallerSession(
+  target: { agent?: string; sessionKey?: string; sessionId?: string },
+  caller: CallerSession,
+  defaultAgent?: string,
+): boolean {
+  if (target.sessionId && caller.sessionId && target.sessionId === caller.sessionId) return true;
+  if (!target.sessionKey || !caller.sessionKey) return false;
+  const raw = target.sessionKey.toLowerCase();
+  const key = raw.startsWith("agent:") ? raw : `agent:${(target.agent ?? defaultAgent ?? "main").toLowerCase()}:${raw}`;
+  return key === caller.sessionKey.toLowerCase();
 }
