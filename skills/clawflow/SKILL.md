@@ -197,7 +197,7 @@ AI nodes support an `attachments` field — an array of file paths or URLs sent 
 
 ### do: exec — deterministic shell execution
 
-Runs a command with no AI involved. Returns `{ stdout, stderr, exitCode }`. Non-zero exit codes are captured, not thrown.
+Runs a command with no AI involved. Returns `{ stdout, stderr, exitCode }`. Non-zero exit codes are captured, not thrown. The step fails, and its command and everything it started are stopped, when it times out, when its output passes 10 MB, or when the run is cancelled.
 
 ```json
 {
