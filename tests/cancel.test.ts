@@ -54,13 +54,15 @@ async function startOn(runner: FlowRunner, flow: FlowDefinition, id: string, nod
 }
 
 describe("cancel: a run executing in this process", () => {
-  it("kills the exec step's process, ends the run cancelled, and runs nothing after it", async () => {
+  it("stops the exec step's command, ends the run cancelled, and runs nothing after it", async () => {
+    // The command runs as a child of the shell, as it does under dash (/bin/sh
+    // on Debian and Ubuntu), so killing only the shell would leave it running.
     const runner = new FlowRunner(cfg);
     const pidFile = path.join(tmpDir, "exec.pid");
     const flow: FlowDefinition = {
       flow: "long-exec",
       nodes: [
-        { name: "work", do: "exec", command: `echo $$ > ${pidFile}; exec sleep 30`, timeout: "60s" },
+        { name: "work", do: "exec", command: `sleep 30 & echo $! > ${pidFile}; wait`, timeout: "60s" },
         { name: "after", do: "code", run: "1", output: "after" },
       ],
     };
@@ -83,7 +85,7 @@ describe("cancel: a run executing in this process", () => {
     assert.equal(record.running, undefined);
     assert.deepEqual(record.trace.map((t) => [t.node, t.status]), [["work", "cancelled"]]);
     assert.equal(record.state.after, undefined, "the step after the cancelled one never ran");
-    await until(() => !alive(pid), 2_000, "the exec process to exit");
+    await until(() => !alive(pid), 2_000, "the exec step's command to exit");
   });
 
   it("sends the agent step's openclaw process SIGTERM, which is how the CLI aborts its turn", async () => {
@@ -169,19 +171,45 @@ describe("cancel: a run executing in this process", () => {
 });
 
 describe("cancel: a step's own timeout", () => {
-  it("stops the timed-out attempt's process before the next attempt starts", async () => {
+  it("stops the timed-out attempt's command before the next attempt starts", async () => {
     const runner = new FlowRunner(cfg);
     const pids = path.join(tmpDir, "timeout-pids");
     const flow: FlowDefinition = {
       flow: "timeout-exec",
-      nodes: [{ name: "work", do: "exec", command: `echo $$ >> ${pids}; exec sleep 30`, timeout: "300ms", retry: { limit: 2, delay: 0 } }],
+      nodes: [{ name: "work", do: "exec", command: `sleep 30 & echo $! >> ${pids}; wait`, timeout: "300ms", retry: { limit: 2, delay: 0 } }],
     };
     const result = await runner.run(flow, {}, "timeout-retry");
     assert.equal(result.status, "failed");
     assert.match(result.error ?? "", /timed out after 300ms/);
     const started = fs.readFileSync(pids, "utf8").trim().split("\n").map(Number);
     assert.equal(started.length, 2);
-    await until(() => started.every((pid) => !alive(pid)), 2_000, "both attempts' processes to exit");
+    await until(() => started.every((pid) => !alive(pid)), 2_000, "both attempts' commands to exit");
+  });
+});
+
+describe("exec step: the process group", () => {
+  it("fails the step and stops the command when its output passes 10 MB", async () => {
+    const runner = new FlowRunner(cfg);
+    const flow: FlowDefinition = {
+      flow: "exec-flood",
+      nodes: [{ name: "flood", do: "exec", command: "head -c 11000000 /dev/zero; sleep 30", timeout: "60s" }],
+    };
+    const t0 = Date.now();
+    const result = await runner.run(flow, {}, "exec-flood");
+    assert.equal(result.status, "failed");
+    assert.match(result.error ?? "", /output exceeded 10485760 bytes/);
+    assert.ok(Date.now() - t0 < 10_000, "stopped at once, not after the sleep");
+  });
+
+  it("fails the step when its folder does not exist", async () => {
+    const runner = new FlowRunner(cfg);
+    const flow: FlowDefinition = {
+      flow: "exec-no-cwd",
+      nodes: [{ name: "here", do: "exec", command: "pwd", cwd: path.join(tmpDir, "no-such-dir") }],
+    };
+    const result = await runner.run(flow, {}, "exec-no-cwd");
+    assert.equal(result.status, "failed");
+    assert.match(result.error ?? "", /exec "here" failed/);
   });
 });
 

@@ -1962,42 +1962,76 @@ export class FlowRunner {
     state: FlowState,
     signal: AbortSignal,
   ): Promise<{ output: unknown }> {
-    const { exec } = await import("child_process");
-    const { promisify } = await import("util");
-    const execAsync = promisify(exec);
+    const { spawn } = await import("child_process");
 
     // command/cwd templates already interpolated by resolveNodeFields
     const command = node.command;
     const cwd = node.cwd ?? undefined;
+    const timeoutMs = node.timeout ? parseDuration(node.timeout) : (this.cfg.maxNodeDurationMs ?? 30_000);
+    const maxBuffer = 10 * 1024 * 1024; // 10MB
+    if (signal.aborted) throw abortReason(signal);
 
-    try {
-      const { stdout, stderr } = await execAsync(command, {
-        timeout: node.timeout
-          ? parseDuration(node.timeout)
-          : (this.cfg.maxNodeDurationMs ?? 30_000),
-        maxBuffer: 10 * 1024 * 1024, // 10MB
-        cwd,
-        // On abort the shell gets SIGTERM, as on its own timeout.
-        signal,
-      });
-      return {
-        output: { stdout: stdout.trimEnd(), stderr: stderr.trimEnd(), exitCode: 0 },
+    // The shell gets a process group of its own, and a cancel, the step's
+    // timeout or too much output stops the whole group. Signalling only the
+    // shell left the command running: dash, /bin/sh on Debian and Ubuntu, forks
+    // a command rather than replacing itself with it.
+    const ownGroup = process.platform !== "win32";
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, { shell: true, cwd, detached: ownGroup, stdio: ["ignore", "pipe", "pipe"] });
+      const out: Buffer[] = [];
+      const err: Buffer[] = [];
+      let size = 0;
+      let settled = false;
+      const stopGroup = () => {
+        try {
+          if (ownGroup && child.pid) process.kill(-child.pid, "SIGTERM");
+          else child.kill("SIGTERM");
+        } catch {
+          // already gone
+        }
       };
-    } catch (err: unknown) {
-      if (signal.aborted) throw abortReason(signal);
-      const e = err as { stdout?: string; stderr?: string; code?: number; message?: string };
-      // Non-zero exit is not a runtime error — return the result with exitCode
-      if (e.code != null && e.stdout !== undefined) {
-        return {
-          output: {
-            stdout: (e.stdout ?? "").trimEnd(),
-            stderr: (e.stderr ?? "").trimEnd(),
-            exitCode: e.code,
-          },
-        };
-      }
-      throw new Error(`exec "${node.name}" failed: ${e.message ?? String(err)}`);
-    }
+      const settle = (done: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        done();
+      };
+      const fail = (reason: Error) => {
+        stopGroup();
+        settle(() => reject(reason));
+      };
+      const onAbort = () => fail(abortReason(signal));
+      const timer = setTimeout(
+        () => fail(new Error(`exec "${node.name}" failed: timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+      signal.addEventListener("abort", onAbort, { once: true });
+      const collect = (into: Buffer[]) => (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > maxBuffer) fail(new Error(`exec "${node.name}" failed: output exceeded ${maxBuffer} bytes`));
+        else into.push(chunk);
+      };
+      child.stdout!.on("data", collect(out));
+      child.stderr!.on("data", collect(err));
+      child.on("error", (e) => settle(() => reject(new Error(`exec "${node.name}" failed: ${e.message}`))));
+      child.on("close", (code, sig) =>
+        settle(() => {
+          if (code === null) {
+            reject(new Error(`exec "${node.name}" failed: the shell was killed by ${sig}`));
+            return;
+          }
+          // Non-zero exit is not a runtime error: return the result with exitCode
+          resolve({
+            output: {
+              stdout: Buffer.concat(out).toString("utf8").trimEnd(),
+              stderr: Buffer.concat(err).toString("utf8").trimEnd(),
+              exitCode: code,
+            },
+          });
+        }),
+      );
+    });
   }
 
   // ---- Template helpers ---------------------------------------------------------
