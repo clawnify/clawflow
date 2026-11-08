@@ -57,6 +57,10 @@ for (const backend of ["json", "sqlite", "postgres"] as const) {
         assert.equal((await runner.listApprovals()).length, 0);
         assert.equal((await request(`/${paused.instanceId}/resume`, { method: "POST", body: '{"approved":true}' })).status, 409);
       }
+      const alias = await runner.run(flow as any, {}, "alias!");
+      assert.equal((await request("/alias_/resume", { method: "POST", body: '{"approved":false}' })).status, 404,
+        "a filename-safe alias must not cancel a different actual ID");
+      await runner.resume(alias.instanceId, flow as any, false);
       const get = store.get.bind(store);
       store.get = () => { throw new Error("db secret must never appear"); };
       const failed = await request("/root_%25");

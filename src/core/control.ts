@@ -75,7 +75,7 @@ export async function controlRequest(
       catch { json(res, 400, { error: "Invalid JSON body" }); return true; }
       if (!body || typeof body.approved !== "boolean") { json(res, 400, { error: "approved must be boolean" }); return true; }
       const run = await store.get(id);
-      if (!run) { json(res, 404, { error: "Run not found", code: "run_not_found" }); return true; }
+      if (!run || run.instanceId !== id) { json(res, 404, { error: "Run not found", code: "run_not_found" }); return true; }
       if (run.status !== "paused" && run.status !== "waiting") {
         json(res, 409, { error: "Run is not paused", code: "run_not_paused" }); return true;
       }
