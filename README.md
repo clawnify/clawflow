@@ -669,7 +669,11 @@ update cursor, revision, complete inventory guarantee, or deletion tombstones.
 When the HTTP listener is enabled, authenticated management routes use the
 same configured runner:
 
-- `GET /flows/runs?limit=20&cursor=...&flow=...&status=...`
+- `GET /flows/runs?limit=20&cursor=...&flow=...&status=...`.
+  Optional `include_oldest=1` adds `oldest: { instanceId, updatedAt } | null`
+  across all matching runs, before cursor filtering. The store option is
+  `includeOldest: true`. SQL count, oldest checkpoint and page share one
+  transaction; this identifies old checkpoints without declaring runs dead.
 - `GET /flows/runs/:instanceId` for the complete record; optional `path`, `offset`,
   `limit`, `max_chars` use `readRunValue`. URL-encode actual instance IDs.
 - `GET /flows/runs/:instanceId/subruns?limit=20&node=...` for descendant summaries.

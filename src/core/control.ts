@@ -44,7 +44,7 @@ export async function controlRequest(
   try {
     if (req.method === "GET" && (!id || (parts.length === 2 && parts[1] === "subruns"))) {
       const opts = { limit: qs.has("limit") ? Number(qs.get("limit")) : undefined, cursor: qs.get("cursor") || undefined,
-        flow: qs.get("flow") || undefined, status: qs.get("status") || undefined, node: qs.get("node") || undefined };
+        flow: qs.get("flow") || undefined, status: qs.get("status") || undefined, node: qs.get("node") || undefined, includeOldest: qs.get("include_oldest") === "1" };
       try { parseRunPage(opts); } catch (err) { json(res, 400, { error: (err as Error).message }); return true; }
       const page = id ? await store.listSubRuns(id, opts) : await store.listRuns(opts);
       json(res, 200, { ok: true, ...page });

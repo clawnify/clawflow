@@ -44,6 +44,8 @@ export type RunRow = RunIndexEntry;
 
 export interface RunPage {
   runs: RunRow[];
+  /** Oldest updated matching record, before cursor filtering; present only when requested. */
+  oldest?: { instanceId: string; updatedAt: string } | null;
   /** Runs matching the filters, across all pages. */
   total: number;
   /** Pass back as `cursor` for the next page; null on the last page. */
@@ -58,6 +60,8 @@ export interface ListRunsOptions {
   /** Only runs of this flow (the definition's `flow` name). */
   flow?: string;
   status?: string;
+  /** Include the oldest checkpoint identity across all matching records. */
+  includeOldest?: boolean;
 }
 
 /**
@@ -96,7 +100,10 @@ export function pageRunRows(rows: RunRow[], opts: ListRunsOptions = {}): RunPage
   const rest = after ? rows.filter((r) => newestFirst(r, after) > 0) : rows;
   const page = rest.slice(0, limit);
   const last = page[page.length - 1];
+  const oldest = opts.includeOldest ? rows.reduce<RunRow | undefined>((best, row) =>
+    !best || row.updatedAt < best.updatedAt || (row.updatedAt === best.updatedAt && row.instanceId < best.instanceId) ? row : best, undefined) : undefined;
   return {
+    ...(opts.includeOldest ? { oldest: oldest ? { instanceId: oldest.instanceId, updatedAt: oldest.updatedAt } : null } : {}),
     runs: page,
     total: rows.length,
     next_cursor: rest.length > limit && last ? encodeCursor(last) : null,
@@ -108,7 +115,7 @@ export interface ListSubRunsOptions extends ListRunsOptions { node?: string }
 export function listSubRuns(stateDir: string, parentId: string, opts: ListSubRunsOptions = {}): RunPage {
   parseRunPage(opts);
   const rows: RunRow[] = [];
-  if (!fs.existsSync(stateDir)) return { runs: [], total: 0, next_cursor: null };
+  if (!fs.existsSync(stateDir)) return pageRunRows([], opts);
   const prefix = `${parentId}:`;
   const filePrefix = prefix.replace(/[^a-zA-Z0-9_-]/g, "_");
   for (const file of fs.readdirSync(stateDir)) {

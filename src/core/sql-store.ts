@@ -167,6 +167,9 @@ export class SqlStateStore implements ExecutionStore {
       if (opts.flow) { params.push(opts.flow); where += ` AND flow_name=$${params.length}`; }
       if (opts.status) { params.push(opts.status); where += ` AND status=$${params.length}`; }
       const count = await q(`SELECT COUNT(*) AS total FROM clawflow_runs WHERE ${where}`, params);
+      const oldestRows = opts.includeOldest
+        ? await q(`SELECT id,updated_at FROM clawflow_runs WHERE ${where} ORDER BY updated_at ASC,id ASC LIMIT 1`, params) : [];
+      const oldest = oldestRows[0] ? { instanceId: oldestRows[0].id as string, updatedAt: oldestRows[0].updated_at as string } : null;
       if (after) {
         params.push(after.createdAt, after.instanceId);
         where += ` AND (created_at < $${params.length - 1} OR (created_at = $${params.length - 1} AND id < $${params.length}))`;
@@ -174,7 +177,7 @@ export class SqlStateStore implements ExecutionStore {
       params.push(limit + 1);
       const rows = await q(`SELECT summary FROM clawflow_runs WHERE ${where} ORDER BY created_at DESC,id DESC LIMIT $${params.length}`, params);
       const runs = rows.slice(0, limit).map((r) => JSON.parse(r.summary as string));
-      return { runs, total: Number(count[0].total), next_cursor: rows.length > limit ? encodeCursor(runs[runs.length - 1]) : null };
+      return { ...(opts.includeOldest ? { oldest } : {}), runs, total: Number(count[0].total), next_cursor: rows.length > limit ? encodeCursor(runs[runs.length - 1]) : null };
     }, false);
   }
 

@@ -32,6 +32,20 @@ for (const backend of ["json", "sqlite", "postgres"] as const) {
       // Case-insensitive filesystems cannot retain this distinct legacy JSON ID.
       if (backend !== "json") await store.create("root_%:loop:ITEMS:0", "child", {});
       await store.create("root_AB:loop:items:0", "unrelated", {});
+      const old = { ...(await store.get("root_%"))!, instanceId: "oldest-checkpoint",
+        createdAt: "2001-01-01T00:00:00.000Z", updatedAt: "2002-01-01T00:00:00.000Z" };
+      const childOld = { ...old, instanceId: "root_%:loop:other:999", updatedAt: "1900-01-01T00:00:00.000Z" };
+      if (backend === "json") {
+        for (const record of [old, childOld]) writeFileSync(join(dir, record.instanceId.replace(/[^a-zA-Z0-9_-]/g, "_") + ".json"), JSON.stringify(record));
+      } else await (store as any).importRecords([old, childOld], []);
+      const active = await (await request("?status=running&limit=1&include_oldest=1")).json() as any;
+      assert.equal(active.total, 2, "children are excluded from the root count");
+      assert.equal(active.oldest.instanceId, "oldest-checkpoint");
+      assert.notEqual(active.runs[0].instanceId, active.oldest.instanceId);
+      assert.equal(active.oldest.updatedAt, "2002-01-01T00:00:00.000Z");
+      assert.equal(active.runs.length, 1);
+      const empty = await (await request("?status=paused&include_oldest=1")).json() as any;
+      assert.equal(empty.oldest, null);
       const seen: string[] = [];
       let cursor: string | undefined;
       do {
