@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { listRuns, sweepRuns, type ListRunsOptions } from "./runs.js";
+import { listRuns, listSubRuns, sweepRuns, type ListRunsOptions, type ListSubRunsOptions } from "./runs.js";
 import type { FlowState, FlowResult, TraceEntry, PendingApproval, RunningStep } from "./types.js";
 
 // ---- Durable State Store --------------------------------------------------------
@@ -136,6 +136,7 @@ export class StateStore {
   get identity(): string { return `json:${path.resolve(this.dir)}`; }
 
   listRuns(opts?: ListRunsOptions) { return listRuns(this.dir, opts); }
+  listSubRuns(parentId: string, opts?: ListSubRunsOptions) { return listSubRuns(this.dir, parentId, opts); }
   sweep(days: number, now?: number) { return sweepRuns(this.dir, days, now); }
   close(): void {}
 

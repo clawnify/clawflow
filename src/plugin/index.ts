@@ -157,7 +157,7 @@ interface PluginApi {
   ) => void;
   config?: {
     plugins?: { entries?: Record<string, { config?: PluginConfig }> };
-    gateway?: { port?: number; host?: string };
+    gateway?: { port?: number; host?: string; auth?: { token?: string } };
     session?: { mainKey?: string };
     [key: string]: unknown;
   };
@@ -225,6 +225,7 @@ function register(api: PluginApi) {
     startFlowServer({
       runner,
       serve: pluginCfg.serve,
+      controlToken: () => process.env.OPENCLAW_GATEWAY_TOKEN ?? api.config?.gateway?.auth?.token,
       // Same workspace the flow_* tools use, so a triggered run resolves the
       // published version exactly like flow_run does.
       workspace,

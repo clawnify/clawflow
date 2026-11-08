@@ -8,6 +8,9 @@ on:
 
 jobs:
   check:
+    strategy:
+      matrix:
+        node: [22, 24]
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -28,7 +31,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
 
       - run: npm ci
 

@@ -5,6 +5,7 @@ import type { FlowRunner } from "./runner.js";
 import { validateFlow } from "./validate.js";
 import type { CreateTriggerInput, TriggerRecord, TriggerStore } from "./triggers.js";
 import { assertValidSchedule, type TriggerScheduler } from "./scheduler.js";
+import { controlRequest } from "./control.js";
 import { resolveRunnableFlow } from "./manage.js";
 
 // ---- Flow Server ----------------------------------------------------------------
@@ -20,6 +21,8 @@ import { resolveRunnableFlow } from "./manage.js";
 
 export interface FlowServerOpts {
   runner: FlowRunner;
+  /** Bearer for management reads/resume. Defaults to OPENCLAW_GATEWAY_TOKEN. */
+  controlToken?: () => string | undefined;
   serve: ServeConfig;
   /**
    * Workspace root — where published versions live (.clawflow/versions).
@@ -46,6 +49,7 @@ const MAX_BODY_BYTES = 1_048_576; // 1 MB
 // Guard against double-init when register() is called more than once
 // (OpenClaw calls it during discovery and again at gateway startup).
 let activeServer: http.Server | null = null;
+let activeOpts: FlowServerOpts | null = null;
 
 function resolveWorkspace(workspace?: string): string {
   return workspace ?? process.env.OPENCLAW_WORKSPACE ?? process.cwd();
@@ -87,9 +91,10 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 export function startFlowServer(opts: FlowServerOpts): http.Server {
+  activeOpts = opts;
   if (activeServer) return activeServer;
 
-  const { runner, serve, logger } = opts;
+  const { serve, logger } = opts;
   const basePath = (serve.path ?? "/flows").replace(/\/+$/, "");
   const workspace = resolveWorkspace(opts.workspace);
   const flowsDir = resolveFlowsDir(serve, workspace);
@@ -100,8 +105,13 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
   };
 
   const server = http.createServer(async (req, res) => {
+    const current = activeOpts ?? opts;
+    const runner = current.runner;
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const pathname = url.pathname.replace(/\/+$/, "") || "/";
+
+    if (await controlRequest(req, res, url, basePath, runner, current.controlToken?.() ?? process.env.OPENCLAW_GATEWAY_TOKEN, json, readBody,
+      (name) => resolveRunnableFlow(resolveWorkspace(current.workspace), resolveFlowsDir(current.serve, resolveWorkspace(current.workspace)), name)?.def ?? null)) return;
 
     // Health check
     if (req.method === "GET" && pathname === `${basePath}/health`) {
@@ -415,6 +425,7 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
   });
 
   activeServer = server;
+  server.on("close", () => { if (activeServer === server) { activeServer = null; activeOpts = null; } });
 
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {

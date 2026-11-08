@@ -80,13 +80,18 @@ export function parseRunPage(opts: ListRunsOptions) {
 }
 
 export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage {
-  const { limit, after } = parseRunPage(opts);
+  parseRunPage(opts);
   const rows: RunRow[] = [];
   for (const row of readTopLevelRows(stateDir)) {
     if (opts.flow && row.flowName !== opts.flow) continue;
     if (opts.status && row.status !== opts.status) continue;
     rows.push(row);
   }
+  return pageRunRows(rows, opts);
+}
+
+export function pageRunRows(rows: RunRow[], opts: ListRunsOptions = {}): RunPage {
+  const { limit, after } = parseRunPage(opts);
   rows.sort(newestFirst);
   const rest = after ? rows.filter((r) => newestFirst(r, after) > 0) : rows;
   const page = rest.slice(0, limit);
@@ -96,6 +101,26 @@ export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage 
     total: rows.length,
     next_cursor: rest.length > limit && last ? encodeCursor(last) : null,
   };
+}
+
+export interface ListSubRunsOptions extends ListRunsOptions { node?: string }
+
+export function listSubRuns(stateDir: string, parentId: string, opts: ListSubRunsOptions = {}): RunPage {
+  parseRunPage(opts);
+  const rows: RunRow[] = [];
+  if (!fs.existsSync(stateDir)) return { runs: [], total: 0, next_cursor: null };
+  const prefix = `${parentId}:`;
+  const filePrefix = prefix.replace(/[^a-zA-Z0-9_-]/g, "_");
+  for (const file of fs.readdirSync(stateDir)) {
+    if (!file.startsWith(filePrefix) || !file.endsWith(".json")) continue;
+    const r = JSON.parse(fs.readFileSync(path.join(stateDir, file), "utf8")) as InstanceRecord;
+    if (!r.instanceId?.startsWith(prefix)) continue;
+    if (opts.node && r.instanceId.slice(prefix.length).split(":")[1] !== opts.node) continue;
+    if (opts.flow && r.flowName !== opts.flow) continue;
+    if (opts.status && r.status !== opts.status) continue;
+    rows.push(runIndexEntry(r));
+  }
+  return pageRunRows(rows, opts);
 }
 
 type Keyed = { createdAt: string; instanceId: string };

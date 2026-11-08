@@ -80,6 +80,7 @@ export {
 export type { PublishResult } from "./core/manage.js";
 export {
   listRuns,
+  listSubRuns,
   summarizeRun,
   runView,
   readRunValue,
@@ -91,6 +92,7 @@ export type {
   RunRow,
   RunPage,
   ListRunsOptions,
+  ListSubRunsOptions,
   RunSummary,
   TraceSummary,
   ValueOutline,

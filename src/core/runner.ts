@@ -138,6 +138,8 @@ export class FlowRunner {
     return sendEvent(instanceId, eventType, payload, this.store.identity);
   }
 
+  get storageBackend(): string { return this.cfg.storage?.backend ?? "json"; }
+
   private runKey(id: string): string { return `${this.store.identity}\0${id}`; }
 
   /** Release database resources after runs have settled. */
@@ -288,6 +290,7 @@ export class FlowRunner {
     token: string,
     flow: FlowDefinition,
     approvedOrPayload: boolean | unknown = true,
+    onClaimed?: (instanceId: string) => void,
   ): Promise<FlowResult> {
     let pausedAtIndex = 0;
     // Pure transform under the store's transaction/lock: competing resumes
@@ -313,6 +316,7 @@ export class FlowRunner {
       }
       return { ...current, trace, status: declined ? "cancelled" : "running", resumeToken: undefined, waitingFor: undefined, pausedAtIndex: undefined };
     });
+    onClaimed?.(record.instanceId);
     if (record.status === "cancelled") {
       return { ok: true, status: "cancelled", flowName: record.flowName, instanceId: record.instanceId, state: record.state, trace: record.trace, error: "Flow cancelled at approval gate" };
     }

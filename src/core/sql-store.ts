@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { runIndexEntry, type InstanceRecord } from "./store.js";
 import type { FlowState, PendingApproval } from "./types.js";
 import type { ExecutionStore, StorageConfig } from "./storage.js";
-import { encodeCursor, parseRunPage, type ListRunsOptions, type RunPage, type SweepResult } from "./runs.js";
+import { encodeCursor, parseRunPage, type ListRunsOptions, type ListSubRunsOptions, type RunPage, type SweepResult } from "./runs.js";
 import { PostgresDriver, SqliteDriver, canonicalStoragePath, type Query, type SqlDriver } from "./sql-driver.js";
 
 export class SqlStateStore implements ExecutionStore {
@@ -137,10 +137,33 @@ export class SqlStateStore implements ExecutionStore {
   }
 
   listRuns(opts: ListRunsOptions = {}): Promise<RunPage> {
+    return this.pageRuns(opts);
+  }
+
+  listSubRuns(parentId: string, opts: ListSubRunsOptions = {}): Promise<RunPage> {
+    return this.pageRuns(opts, parentId);
+  }
+
+  private pageRuns(opts: ListSubRunsOptions, parentId?: string): Promise<RunPage> {
     const { limit, after } = parseRunPage(opts);
     return this.driver.transaction(async (q) => {
       const params: unknown[] = [this.namespace];
-      let where = "namespace=$1 AND id=root_id";
+      let where = "namespace=$1";
+      if (parentId === undefined) where += " AND id=root_id";
+      else {
+        params.push(parentId.split(":")[0], `${parentId}:`);
+        where += " AND root_id=$2 AND substr(id, 1, length($3))=$3";
+        if (opts.node) {
+          if (opts.node.includes(":")) where += " AND 1=0";
+          else {
+            const filters = ["loop", "branch", "condition", "parallel"].map((kind) => {
+              params.push(`${parentId}:${kind}:${opts.node!}:`);
+              return `substr(id, 1, length($${params.length}))=$${params.length}`;
+            });
+            where += ` AND (${filters.join(" OR ")})`;
+          }
+        }
+      }
       if (opts.flow) { params.push(opts.flow); where += ` AND flow_name=$${params.length}`; }
       if (opts.status) { params.push(opts.status); where += ` AND status=$${params.length}`; }
       const count = await q(`SELECT COUNT(*) AS total FROM clawflow_runs WHERE ${where}`, params);

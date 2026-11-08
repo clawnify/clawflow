@@ -658,6 +658,41 @@ try {
 }
 ```
 
+`store.listSubRuns(parentId, { limit, cursor, node?, flow?, status? })` pages
+all retained descendants, preserving their actual `:`-separated IDs. `node`
+filters the immediate node beneath that parent, including its nested descendants.
+It uses the same `(createdAt DESC, instanceId DESC)` order as `listRuns`.
+SQL count and page share one read transaction; different pages and `get` calls
+do not share a snapshot. JSON readers have no snapshot. Neither API provides an
+update cursor, revision, complete inventory guarantee, or deletion tombstones.
+
+When the HTTP listener is enabled, authenticated management routes use the
+same configured runner:
+
+- `GET /flows/runs?limit=20&cursor=...&flow=...&status=...`
+- `GET /flows/runs/:instanceId` for the complete record; optional `path`, `offset`,
+  `limit`, `max_chars` use `readRunValue`. URL-encode actual instance IDs.
+- `GET /flows/runs/:instanceId/subruns?limit=20&node=...` for descendant summaries.
+- `GET /flows/runs/:instanceId?include_subruns=1&node=...` adds the last 20
+  iterations per node and counts of omitted iterations for detail views.
+- `POST /flows/runs/:instanceId/resume` with `{ "approved": true }` or `false`.
+  Approval resolves the definition through `resolveRunnableFlow` (published
+  version preferred); decline atomically cancels and consumes its approval.
+  A 202 is sent only after the durable resume claim, before later steps finish.
+
+The configured listener prefix replaces `/flows`. These new routes require
+`Authorization: Bearer <OPENCLAW_GATEWAY_TOKEN>` (or the host gateway's configured
+token; standalone hosts may supply `controlToken` to `startFlowServer`). Without
+a token they refuse access. Optional `X-ClawFlow-Backend: sqlite|postgres|json`
+refuses a stale runner whose backend differs from the caller's configuration.
+Storage errors return 503 without credentials or a JSON fallback. The existing
+run/trigger/cancel routes retain their prior authentication contract.
+
+Run records do not yet bind an executed definition version/hash or trusted
+actor/session access scope. Keep the relevant definition unchanged while a run
+is paused. Do not infer historical provenance or access grants from missing
+fields. Management reads are operator access, not a per-user authorization layer.
+
 For a standalone runner, call `await runner.close()` once its runs have settled.
 This closes the SQLite handle or PostgreSQL pool. Close a reader when it is no
 longer needed; avoid opening a new pool for each request in a long-lived host.

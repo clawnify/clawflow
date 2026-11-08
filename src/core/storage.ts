@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { StateStore, type InstanceRecord } from "./store.js";
 import { SqlStateStore } from "./sql-store.js";
 import type { FlowState, PendingApproval } from "./types.js";
-import type { ListRunsOptions, RunPage, SweepResult } from "./runs.js";
+import type { ListRunsOptions, ListSubRunsOptions, RunPage, SweepResult } from "./runs.js";
 
 export type StorageConfig =
   | { backend: "json" }
@@ -29,6 +29,7 @@ export interface ExecutionStore {
   resolveApproval(token: string): Awaitable<PendingApproval | null>;
   listApprovals(): Awaitable<PendingApproval[]>;
   listRuns(opts?: ListRunsOptions): Awaitable<RunPage>;
+  listSubRuns(parentId: string, opts?: ListSubRunsOptions): Awaitable<RunPage>;
   sweep(retentionDays: number, now?: number): Promise<SweepResult>;
   close(): Awaitable<void>;
 }
