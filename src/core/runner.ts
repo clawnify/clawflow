@@ -30,7 +30,8 @@ import {
   NODE_FIELD_MODES,
   parseDuration,
 } from "./types.js";
-import { StateStore } from "./store.js";
+import { createStateStore, type ExecutionStore } from "./storage.js";
+import type { PendingApproval } from "./types.js";
 import { validateFlow } from "./validate.js";
 import {
   defaultRegistry,
@@ -80,8 +81,14 @@ export function sendEvent(
   instanceId: string,
   eventType: string,
   payload: unknown,
+  storageIdentity?: string,
 ): boolean {
-  const waiters = eventBus.get(instanceId);
+  // Legacy unscoped callers work when the instance is unambiguous. A host
+  // serving multiple stores must use runner.sendEvent() to select its scope.
+  const keys = storageIdentity ? [`${storageIdentity}\0${instanceId}`]
+    : [...eventBus.keys()].filter((key) => key.endsWith(`\0${instanceId}`) && eventBus.get(key)?.has(eventType));
+  if (keys.length !== 1) return false;
+  const waiters = eventBus.get(keys[0]);
   if (!waiters) return false;
   const waiter = waiters.get(eventType);
   if (!waiter) return false;
@@ -118,13 +125,27 @@ function applyFilter(val: unknown, filter: string): unknown {
 
 export class FlowRunner {
   private cfg: PluginConfig;
-  private store: StateStore;
+  private store: ExecutionStore;
   private registry: StepRegistry;
 
   constructor(cfg: PluginConfig) {
     this.cfg = cfg;
-    this.store = new StateStore(cfg.stateDir);
+    this.store = createStateStore(cfg.stateDir, cfg.storage);
     this.registry = cfg.customSteps ?? defaultRegistry;
+  }
+
+  sendEvent(instanceId: string, eventType: string, payload: unknown): boolean {
+    return sendEvent(instanceId, eventType, payload, this.store.identity);
+  }
+
+  private runKey(id: string): string { return `${this.store.identity}\0${id}`; }
+
+  /** Release database resources after runs have settled. */
+  async close(): Promise<void> {
+    if ([...liveRuns.keys()].some((key) => key.startsWith(`${this.store.identity}\0`))) {
+      throw new Error("Cannot close storage while flows are running");
+    }
+    await this.store.close();
   }
 
   // ---- Start a new run ----------------------------------------------------------
@@ -188,8 +209,8 @@ export class FlowRunner {
       }
       if (missing.length > 0) {
         const error = `Missing required input${missing.length > 1 ? "s" : ""}: ${missing.join(", ")}`;
-        this.store.create(id, flow.flow, state);
-        this.store.update(id, { status: "failed", error });
+        await this.store.create(id, flow.flow, state);
+        await this.store.update(id, { status: "failed", error });
         return {
           ok: false, status: "failed", flowName: flow.flow ?? "unknown",
           instanceId: id, state, trace: [], error,
@@ -198,7 +219,7 @@ export class FlowRunner {
     }
 
     // Create state record first — ensures a state file exists even if env resolution fails
-    this.store.create(id, flow.flow, state);
+    await this.store.create(id, flow.flow, state);
 
     // Seed state.env: flow defaults → shell-expand $(…) → process.env overrides
     if (flow.env) {
@@ -222,7 +243,7 @@ export class FlowRunner {
             const resolved = stdout.trim();
             if (!resolved) {
               const error = `env var "${k}": command "${v}" returned empty`;
-              this.store.update(id, { status: "failed", error });
+              await this.store.update(id, { status: "failed", error });
               return {
                 ok: false, status: "failed", flowName: flow.flow ?? "unknown",
                 instanceId: id, state, trace: [], error,
@@ -231,7 +252,7 @@ export class FlowRunner {
             env[k] = resolved;
           } catch (err) {
             const error = `env var "${k}": failed to resolve "${v}": ${err instanceof Error ? err.message : String(err)}`;
-            this.store.update(id, { status: "failed", error });
+            await this.store.update(id, { status: "failed", error });
             return {
               ok: false, status: "failed", flowName: flow.flow ?? "unknown",
               instanceId: id, state, trace: [], error,
@@ -248,7 +269,7 @@ export class FlowRunner {
         .map(([k]) => k);
       if (missing.length > 0) {
         const error = `Missing required env vars: ${missing.join(", ")}`;
-        this.store.update(id, { status: "failed", error });
+        await this.store.update(id, { status: "failed", error });
         return {
           ok: false, status: "failed", flowName: flow.flow ?? "unknown",
           instanceId: id, state, trace: [], error,
@@ -268,77 +289,34 @@ export class FlowRunner {
     flow: FlowDefinition,
     approvedOrPayload: boolean | unknown = true,
   ): Promise<FlowResult> {
-    // Token can be an instanceId (legacy wait nodes) or an approve token
-    let record = this.store.get(token);
-    let instanceId = token;
-
-    // Check if it's an approve token
-    if (!record) {
-      const approval = this.store.resolveApproval(token);
-      if (approval) {
-        record = this.store.get(approval.instanceId);
-        instanceId = approval.instanceId;
+    let pausedAtIndex = 0;
+    // Pure transform under the store's transaction/lock: competing resumes
+    // cannot both claim the pause, and a failed write keeps the approval.
+    const record = await this.store.resume(token, (current) => {
+      if (current.status !== "paused" && current.status !== "waiting") {
+        throw new Error(`Instance "${current.instanceId}" is not paused (status: ${current.status})`);
       }
-    }
-
-    if (!record) throw new Error(`Resume token not found: ${token}`);
-    if (record.status !== "paused" && record.status !== "waiting") {
-      throw new Error(
-        `Instance "${instanceId}" is not paused (status: ${record.status})`,
-      );
-    }
-
-    // Retrieve stored trace from before pause
-    const storedTrace = record.trace ?? [];
-    const pausedAtIndex = record.pausedAtIndex ?? 0;
-
-    if (typeof approvedOrPayload === "boolean" && !approvedOrPayload) {
-      // Update the paused trace entry to "skipped"
-      const pausedEntry = storedTrace.find((t) => t.status === "paused");
-      if (pausedEntry) pausedEntry.status = "skipped";
-      this.store.update(instanceId, { status: "cancelled", trace: storedTrace });
-      return {
-        ok: true,
-        status: "cancelled",
-        flowName: record.flowName,
-        instanceId,
-        state: record.state,
-        trace: storedTrace,
-        error: "Flow cancelled at approval gate",
-      };
-    }
-
-    // Memoize the paused node with the approval payload and set in state
-    const pausedNode = flow.nodes[pausedAtIndex];
-    if (pausedNode) {
-      const isApproval = pausedNode.do === "wait"
-        && (pausedNode as WaitNode).for === "approval";
-      const approvalOutput = isApproval
-        ? { approved: true, approvedAt: new Date().toISOString(), token }
-        : approvedOrPayload;
-      this.store.memoize(instanceId, pausedNode.name, approvalOutput);
-      if (pausedNode.output) record.state[pausedNode.output] = approvalOutput;
-
-      // Update the paused trace entry to "ok"
-      const pausedEntry = storedTrace.find(
-        (t) => t.node === pausedNode.name && t.status === "paused",
-      );
-      if (pausedEntry) {
-        pausedEntry.status = "ok";
-        pausedEntry.output = approvalOutput;
+      pausedAtIndex = current.pausedAtIndex ?? 0;
+      const trace = current.trace ?? [];
+      const declined = typeof approvedOrPayload === "boolean" && !approvedOrPayload;
+      const pausedNode = flow.nodes[pausedAtIndex];
+      if (declined) {
+        const entry = trace.find((t) => t.status === "paused");
+        if (entry) entry.status = "skipped";
+      } else if (pausedNode) {
+        const isApproval = pausedNode.do === "wait" && (pausedNode as WaitNode).for === "approval";
+        const output = isApproval ? { approved: true, approvedAt: new Date().toISOString(), token } : approvedOrPayload;
+        current.completedNodes[pausedNode.name] = output;
+        if (pausedNode.output) current.state[pausedNode.output] = output;
+        const entry = trace.find((t) => t.node === pausedNode.name && t.status === "paused");
+        if (entry) { entry.status = "ok"; entry.output = output; }
       }
-    }
-
-    this.store.update(instanceId, {
-      status: "running",
-      trace: storedTrace,
-      resumeToken: undefined,
-      waitingFor: undefined,
-      pausedAtIndex: undefined,
+      return { ...current, trace, status: declined ? "cancelled" : "running", resumeToken: undefined, waitingFor: undefined, pausedAtIndex: undefined };
     });
-
-    // Continue from the node AFTER the paused one, with preserved trace
-    return this.executeRun(flow, record.state, instanceId, pausedAtIndex + 1, storedTrace);
+    if (record.status === "cancelled") {
+      return { ok: true, status: "cancelled", flowName: record.flowName, instanceId: record.instanceId, state: record.state, trace: record.trace, error: "Flow cancelled at approval gate" };
+    }
+    return this.executeRun(flow, record.state, record.instanceId, pausedAtIndex + 1, record.trace);
   }
 
   // ---- Cancel -------------------------------------------------------------------
@@ -357,8 +335,8 @@ export class FlowRunner {
    * and keeps that status.
    */
   async cancel(instanceId: string, reason = "Cancelled"): Promise<CancelResult> {
-    const live = liveRuns.get(instanceId);
-    const record = this.store.get(instanceId);
+    const live = liveRuns.get(this.runKey(instanceId));
+    const record = await this.store.get(instanceId);
     if (!live && !record) return { ok: false, instanceId, error: "not_found" };
     if (!live && record && FINISHED_STATUSES.has(record.status)) {
       return { ok: false, instanceId, error: "finished", status: record.status };
@@ -376,7 +354,7 @@ export class FlowRunner {
         }),
       ]);
       clearTimeout(bound);
-      const status = this.store.get(instanceId)?.status ?? "cancelled";
+      const status = (await this.store.get(instanceId))?.status ?? "cancelled";
       return { ok: true, instanceId, status: status === "cancelled" ? "cancelled" : "cancelling" };
     }
 
@@ -384,8 +362,8 @@ export class FlowRunner {
     const trace = current.trace ?? [];
     const paused = trace.find((t) => t.status === "paused");
     if (paused) paused.status = "cancelled";
-    if (current.resumeToken) this.store.resolveApproval(current.resumeToken);
-    this.store.update(instanceId, {
+    if (current.resumeToken) await this.store.resolveApproval(current.resumeToken);
+    await this.store.update(instanceId, {
       status: "cancelled",
       error: reason,
       trace,
@@ -407,34 +385,34 @@ export class FlowRunner {
     priorTrace: TraceEntry[],
   ): Promise<FlowResult> {
     const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
-    liveRuns.set(instanceId, live);
+    liveRuns.set(this.runKey(instanceId), live);
     try {
       const done = this.execute(flow, state, instanceId, startIndex, priorTrace, live.controller.signal);
       live.done = done;
       return await done;
     } finally {
-      if (liveRuns.get(instanceId) === live) liveRuns.delete(instanceId);
+      if (liveRuns.get(this.runKey(instanceId)) === live) liveRuns.delete(this.runKey(instanceId));
     }
   }
 
   /** End a run (or sub-flow) as cancelled, recording why. */
-  private endCancelled(
+  private async endCancelled(
     flow: FlowDefinition,
     state: FlowState,
     instanceId: string,
     trace: TraceEntry[],
     reason?: string,
-  ): FlowResult {
+  ): Promise<FlowResult> {
     const error = reason || "Cancelled";
-    this.store.update(instanceId, { status: "cancelled", state, trace, error, running: undefined });
+    await this.store.update(instanceId, { status: "cancelled", state, trace, error, running: undefined });
     return { ok: false, status: "cancelled", flowName: flow.flow, instanceId, state, trace, error };
   }
 
   /** A top-level run whose record was marked cancelled from outside this
    *  process while it ran. Sub-flow records are never marked that way. */
-  private cancelledOnRecord(instanceId: string): string | undefined {
+  private async cancelledOnRecord(instanceId: string): Promise<string | undefined> {
     if (instanceId.includes(":")) return undefined;
-    const record = this.store.get(instanceId);
+    const record = await this.store.get(instanceId);
     return record?.status === "cancelled" ? (record.error || "Cancelled") : undefined;
   }
 
@@ -457,7 +435,7 @@ export class FlowRunner {
       const t0 = Date.now();
 
       // One read per step: whether the run was cancelled, and the memo below.
-      const record = this.store.get(instanceId);
+      const record = await this.store.get(instanceId);
       if (signal.aborted) return this.endCancelled(flow, state, instanceId, trace, abortReason(signal).message);
       if (record?.status === "cancelled" && !instanceId.includes(":")) {
         return this.endCancelled(flow, state, instanceId, trace, record.error);
@@ -485,7 +463,8 @@ export class FlowRunner {
 
       try {
         // Say what this run is doing while the step runs; each exit below clears it.
-        this.store.update(instanceId, { running: this.runningStep(node, state) });
+        const starting = await this.store.update(instanceId, { running: this.runningStep(node, state) });
+        if (starting.status === "cancelled") return this.endCancelled(flow, state, instanceId, trace, starting.error);
         const result = await this.runWithRetry(node, state, flow, instanceId, signal);
 
         // ---- Paused for approval (do: wait, for: approval) ----------------------
@@ -497,7 +476,7 @@ export class FlowRunner {
             durationMs: Date.now() - t0,
           };
           trace.push(entry);
-          this.store.update(instanceId, {
+          const paused = await this.store.checkpoint(instanceId, {
             status: "paused",
             state,
             trace,
@@ -510,7 +489,8 @@ export class FlowRunner {
               preview: result.approve.preview,
               timeout: result.approve.timeout,
             },
-          });
+          }, undefined, result.approve.approval);
+          if (paused.status === "cancelled") return this.endCancelled(flow, state, instanceId, trace, paused.error);
           return {
             ok: true,
             status: "paused",
@@ -531,7 +511,6 @@ export class FlowRunner {
 
         // ---- Normal completion --------------------------------------------------
         if (node.output) state[node.output] = result.output;
-        this.store.memoize(instanceId, node.name, result.output);
         const entry: TraceEntry = {
           node: node.name,
           do: node.do,
@@ -541,7 +520,7 @@ export class FlowRunner {
           durationMs: Date.now() - t0,
         };
         trace.push(entry);
-        this.store.update(instanceId, { state, trace, running: undefined });
+        await this.store.checkpoint(instanceId, { state, trace, running: undefined }, { node: node.name, output: result.output });
         i++;
       } catch (err) {
         if (signal.aborted) {
@@ -558,10 +537,10 @@ export class FlowRunner {
           durationMs: Date.now() - t0,
         };
         trace.push(entry);
-        const cancelled = this.cancelledOnRecord(instanceId);
+        const cancelled = await this.cancelledOnRecord(instanceId);
         if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
         const error = `Node "${node.name}": ${message}`;
-        this.store.update(instanceId, { status: "failed", state, trace, error, running: undefined });
+        await this.store.update(instanceId, { status: "failed", state, trace, error, running: undefined });
         return {
           ok: false,
           status: "failed",
@@ -574,9 +553,10 @@ export class FlowRunner {
       }
     }
 
-    const cancelled = this.cancelledOnRecord(instanceId);
+    const cancelled = await this.cancelledOnRecord(instanceId);
     if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
-    this.store.update(instanceId, { status: "completed", state, trace });
+    const finished = await this.store.update(instanceId, { status: "completed", state, trace, error: undefined, running: undefined });
+    if (finished.status === "cancelled") return this.endCancelled(flow, state, instanceId, trace, finished.error);
     return {
       ok: true,
       status: "completed",
@@ -602,7 +582,7 @@ export class FlowRunner {
     signal: AbortSignal,
   ): Promise<{
     output?: unknown;
-    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
+    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string; approval: PendingApproval };
     attempts?: number;
   }> {
     const policy: RetryPolicy = node.retry ?? { limit: 1, delay: 0 };
@@ -685,7 +665,7 @@ export class FlowRunner {
     signal: AbortSignal,
   ): Promise<{
     output?: unknown;
-    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
+    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string; approval: PendingApproval };
   }> {
     // Interpolate every field classified as a template value in NODE_FIELD_MODES,
     // once, before dispatch — so handlers never re-decide "is this field dynamic?".
@@ -1372,7 +1352,7 @@ export class FlowRunner {
       nodes: branch,
     };
     const subId = `${instanceId}:branch:${node.name}:${pathName}`;
-    this.store.create(subId, subFlow.flow, state);
+    await this.store.create(subId, subFlow.flow, state);
     const subResult = await this.execute(subFlow, state, subId, 0, [], signal);
     if (!subResult.ok) {
       throw new Error(
@@ -1410,7 +1390,7 @@ export class FlowRunner {
       nodes: branch,
     };
     const subId = `${instanceId}:condition:${node.name}:${branchName}`;
-    this.store.create(subId, subFlow.flow, state);
+    await this.store.create(subId, subFlow.flow, state);
     const subResult = await this.execute(subFlow, state, subId, 0, [], signal);
     if (!subResult.ok) {
       throw new Error(
@@ -1479,7 +1459,7 @@ export class FlowRunner {
         nodes: node.nodes,
       };
       const subId = `${instanceId}:loop:${node.name}:${results.length}`;
-      this.store.create(subId, subFlow.flow, loopState);
+      await this.store.create(subId, subFlow.flow, loopState);
       const subResult = await this.execute(
         subFlow,
         loopState,
@@ -1513,7 +1493,7 @@ export class FlowRunner {
         nodes: [subNode],
       };
       const subId = `${instanceId}:parallel:${node.name}:${idx}`;
-      this.store.create(subId, subFlow.flow, branchState);
+      await this.store.create(subId, subFlow.flow, branchState);
       const subResult = await this.execute(
         subFlow,
         branchState,
@@ -1676,7 +1656,7 @@ export class FlowRunner {
   ): Promise<{
     output?: unknown;
     pause?: boolean;
-    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string };
+    approve?: { token: string; prompt: string; preview?: unknown; timeout?: string; approval: PendingApproval };
   }> {
     if (node.for === "approval") {
       // prompt template already interpolated by resolveNodeFields
@@ -1697,7 +1677,7 @@ export class FlowRunner {
 
       // Generate approval token and register
       const token = `cf-${crypto.randomUUID().slice(0, 8)}`;
-      this.store.addApproval({
+      const approval: PendingApproval = {
         token,
         instanceId,
         flowName: flow.flow,
@@ -1706,10 +1686,10 @@ export class FlowRunner {
         preview,
         createdAt: new Date().toISOString(),
         expiresAt,
-      });
+      };
 
       return {
-        approve: { token, prompt, preview, timeout },
+        approve: { token, prompt, preview, timeout, approval },
       };
     }
 
@@ -1724,7 +1704,7 @@ export class FlowRunner {
         // Cancelling the run (or this attempt timing out) drops the waiter.
         const onAbort = () => {
           clearTimeout(timeoutHandle);
-          eventBus.get(instanceId)?.delete(eventType);
+          eventBus.get(this.runKey(instanceId))?.delete(eventType);
           reject(abortReason(signal));
         };
         const timeoutHandle = setTimeout(
@@ -1738,9 +1718,9 @@ export class FlowRunner {
           },
           timeoutMs,
         );
-        if (!eventBus.has(instanceId))
-          eventBus.set(instanceId, new Map());
-        eventBus.get(instanceId)!.set(eventType, {
+        if (!eventBus.has(this.runKey(instanceId)))
+          eventBus.set(this.runKey(instanceId), new Map());
+        eventBus.get(this.runKey(instanceId))!.set(eventType, {
           resolve: (value) => {
             signal.removeEventListener("abort", onAbort);
             resolve(value);
@@ -1752,7 +1732,7 @@ export class FlowRunner {
         else signal.addEventListener("abort", onAbort, { once: true });
       });
 
-      eventBus.get(instanceId)?.delete(eventType);
+      eventBus.get(this.runKey(instanceId))?.delete(eventType);
       return { output: payload };
     }
 
@@ -2259,7 +2239,7 @@ export class FlowRunner {
 
   // ---- Instance management ------------------------------------------------------
 
-  getStore(): StateStore {
+  getStore(): ExecutionStore {
     return this.store;
   }
 

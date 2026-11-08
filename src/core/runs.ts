@@ -66,7 +66,7 @@ export interface ListRunsOptions {
  * pages never shift a page under it, and runs created in the same millisecond
  * are neither skipped nor repeated.
  */
-export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage {
+export function parseRunPage(opts: ListRunsOptions) {
   const limit = opts.limit ?? DEFAULT_PAGE;
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) {
     throw new Error(`limit must be a whole number between 1 and ${MAX_PAGE}`);
@@ -76,6 +76,11 @@ export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage 
     throw new Error("cursor is not one this list returned; start again without it");
   }
 
+  return { limit, after };
+}
+
+export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage {
+  const { limit, after } = parseRunPage(opts);
   const rows: RunRow[] = [];
   for (const row of readTopLevelRows(stateDir)) {
     if (opts.flow && row.flowName !== opts.flow) continue;
@@ -102,7 +107,7 @@ function newestFirst(a: Keyed, b: Keyed): number {
   return 0;
 }
 
-function encodeCursor(k: Keyed): string {
+export function encodeCursor(k: Keyed): string {
   return btoa(encodeURIComponent(JSON.stringify([k.createdAt, k.instanceId])));
 }
 

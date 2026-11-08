@@ -138,6 +138,60 @@
             "description": "Retired in 1.6.1 and ignored: flow authoring (flow_create/edit/publish/delete) and schedule changes (flow_trigger) are gated by @clawnify/agent-permissions, the box's permission authority. Kept so existing configs still validate."
           }
         }
+      },
+      "storage": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "const": "json"
+              }
+            },
+            "required": [
+              "backend"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "const": "sqlite"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "backend"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "const": "postgres"
+              },
+              "connectionStringEnv": {
+                "type": "string",
+                "minLength": 1
+              },
+              "namespace": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "backend",
+              "connectionStringEnv",
+              "namespace"
+            ]
+          }
+        ]
       }
     }
   },
@@ -177,6 +231,10 @@
     "approval": {
       "label": "Approval Gate",
       "help": "Prompt the user before flow_run executes. Set enabled=false to disable entirely. Add session-key substrings to skipSessionPatterns to bypass for unattended hooks (e.g. \"email\" for inbound-email automation)."
+    },
+    "storage": {
+      "label": "Execution Storage",
+      "help": "JSON (default), SQLite (Node 22.13+), or PostgreSQL. Stop the runtime and import existing JSON state before switching."
     }
   }
 }

@@ -8,6 +8,10 @@ export { default } from "./plugin/index.js";
 export { FlowRunner, sendEvent, targetsCallerSession, agentStepSessionKey } from "./core/runner.js";
 export type { CallerSession, CancelResult } from "./core/runner.js";
 export { StateStore } from "./core/store.js";
+export type { InstanceRecord, RunIndexEntry } from "./core/store.js";
+export { importJsonState } from "./core/migrate-storage.js";
+export { createStateStore } from "./core/storage.js";
+export type { ExecutionStore, StorageConfig } from "./core/storage.js";
 export { transpileToCloudflare } from "./core/transpile.js";
 export { validateFlow } from "./core/validate.js";
 export type {
