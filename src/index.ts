@@ -66,6 +66,8 @@ export type { FlowServerOpts } from "./core/serve.js";
 export type { ServeConfig } from "./core/types.js";
 export {
   publishDraft,
+  deleteFlow,
+  restoreFlow,
   resolveFlowFile,
   versionsDir,
   listVersions,

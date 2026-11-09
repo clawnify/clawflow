@@ -9,6 +9,10 @@ import {
   defaultRegistry,
   listVersions,
   publishDraft,
+  deleteFlow,
+  restoreFlow,
+  resolveRunnableFlow,
+  TriggerStore,
   readLatestVersion,
   readVersion,
   resolveFlowFile,
@@ -63,6 +67,46 @@ describe("resolveFlowFile", () => {
 
   it("passes absolute paths through", () => {
     assert.equal(resolveFlowFile(workspace, "/tmp/x.json"), "/tmp/x.json");
+  });
+});
+
+describe("recoverable flow deletion", () => {
+  after(cleanup);
+
+  it("bins published versions too, pauses schedules, and restores without rearming", () => {
+    writeDraft("delete-published");
+    publishDraft(workspace, "delete-published");
+    publishDraft(workspace, "delete-published");
+    const triggers = new TriggerStore(workspace);
+    const schedule = triggers.create({ flowName: "delete-published", cron: "0 9 * * *" });
+    const other = triggers.create({ flowName: "other", cron: "0 9 * * *" });
+    const flowsDir = path.join(workspace, "flows");
+    assert.ok(resolveRunnableFlow(workspace, flowsDir, "delete-published"));
+
+    const deleted = deleteFlow(workspace, "delete-published.json");
+    assert.deepEqual(deleted.pausedTriggers, [schedule.id]);
+    assert.equal(resolveRunnableFlow(workspace, flowsDir, "delete-published"), null);
+    assert.equal(resolveRunnableFlow(workspace, flowsDir, "delete-published", 1), null);
+    assert.equal(triggers.get(schedule.id)?.enabled, false);
+    assert.equal(triggers.get(other.id)?.enabled, true);
+    assert.ok(fs.existsSync(deleted.file));
+    assert.ok(fs.existsSync(`${deleted.file}.versions/2.json`));
+
+    restoreFlow(workspace, path.basename(deleted.file), "delete-published");
+    assert.equal(resolveRunnableFlow(workspace, flowsDir, "delete-published")?.version, 2);
+    assert.equal(triggers.get(schedule.id)?.enabled, false);
+  });
+
+  it("keeps separate recoverable entries and never overwrites a new draft on restore", () => {
+    writeDraft("delete-draft");
+    const first = deleteFlow(workspace, "delete-draft");
+    writeDraft("delete-draft");
+    assert.throws(() => restoreFlow(workspace, path.basename(first.file), "delete-draft"), /already exists/);
+    const second = deleteFlow(workspace, "delete-draft");
+    assert.notEqual(first.file, second.file);
+    assert.ok(fs.existsSync(first.file));
+    assert.ok(fs.existsSync(second.file));
+    assert.throws(() => deleteFlow(workspace, "delete-draft"), /not found/);
   });
 });
 
@@ -249,5 +293,14 @@ describe("flow server routes", () => {
     assert.equal(res.status, 404); // routed as run (no such flow saved), not validate
     const body = (await res.json()) as { error: string };
     assert.match(body.error, /Flow not found: validate/);
+  });
+
+  it("refuses a deleted published flow over the real run endpoint", async () => {
+    writeDraft("srv-deleted");
+    publishDraft(workspace, "srv-deleted");
+    deleteFlow(workspace, "srv-deleted");
+    const res = await fetch(`${base}/srv-deleted/run`, { method: "POST", body: "{}" });
+    assert.equal(res.status, 404);
+    assert.match((await res.json() as { error: string }).error, /Flow not found/);
   });
 });
