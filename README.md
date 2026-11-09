@@ -591,7 +591,7 @@ Thirteen tools registered in OpenClaw:
 | Tool | Does |
 |---|---|
 | `flow_create` | Create a new flow definition and save to file |
-| `flow_delete` | Soft-delete a flow (moves to `.clawflow/bin/`) |
+| `flow_delete` | Move a flow and its published versions to `.clawflow/bin/`; pause schedules, keep run history |
 | `flow_restore_from_bin` | List bin contents or restore a deleted flow |
 | `flow_run` | Execute a flow (uses latest published version by default) |
 | `flow_resume` | Resume after an approval gate |
