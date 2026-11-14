@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { listRuns, listSubRuns, sweepRuns, type ListRunsOptions, type ListSubRunsOptions } from "./runs.js";
 import type { FlowState, FlowResult, TraceEntry, PendingApproval, RunningStep } from "./types.js";
 
 // ---- Durable State Store --------------------------------------------------------
@@ -132,6 +133,20 @@ export class StateStore {
   /** The state directory: one `<instanceId>.json` per run (see runs.ts for reads). */
   readonly dir: string;
 
+  get identity(): string { return `json:${path.resolve(this.dir)}`; }
+
+  listRuns(opts?: ListRunsOptions) { return listRuns(this.dir, opts); }
+  listSubRuns(parentId: string, opts?: ListSubRunsOptions) { return listSubRuns(this.dir, parentId, opts); }
+  sweep(days: number, now?: number) { return sweepRuns(this.dir, days, now); }
+  close(): void {}
+
+  checkpoint(id: string, patch: Partial<InstanceRecord>, memo?: { node: string; output: unknown }, approval?: PendingApproval): InstanceRecord {
+    if (memo) this.memoize(id, memo.node, memo.output);
+    const record = this.update(id, patch);
+    if (approval) this.addApproval(approval);
+    return record;
+  }
+
   constructor(stateDir?: string) {
     this.dir =
       stateDir ??
@@ -230,6 +245,15 @@ export class StateStore {
     const approvals = this.listApprovals();
     approvals.push(approval);
     fs.writeFileSync(this.approvalsFile, JSON.stringify(approvals, null, 2));
+  }
+
+  resume(token: string, transform: (record: InstanceRecord) => InstanceRecord): InstanceRecord {
+    const approval = this.listApprovals().find((a) => a.token === token);
+    const record = this.get(token) ?? (approval ? this.get(approval.instanceId) : null);
+    if (!record) throw new Error(`Resume token not found: ${token}`);
+    const updated = this.update(record.instanceId, transform(record));
+    if (record.resumeToken) this.resolveApproval(record.resumeToken);
+    return updated;
   }
 
   resolveApproval(token: string): PendingApproval | null {

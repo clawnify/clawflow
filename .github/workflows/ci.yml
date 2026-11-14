@@ -8,13 +8,30 @@ on:
 
 jobs:
   check:
+    strategy:
+      matrix:
+        node: [22, 24]
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: clawflow
+          POSTGRES_PASSWORD: clawflow-test
+          POSTGRES_DB: clawflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U clawflow -d clawflow_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CLAWFLOW_TEST_POSTGRES_URL: postgresql://clawflow:clawflow-test@localhost:5432/clawflow_test
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
 
       - run: npm ci
 

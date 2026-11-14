@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { FlowRunner, sendEvent } from "../core/runner.js";
+import { FlowRunner } from "../core/runner.js";
 
 import { startFlowServer } from "../core/serve.js";
 import { TriggerStore } from "../core/triggers.js";
@@ -18,11 +18,10 @@ import {
 } from "../core/manage.js";
 import {
   DEFAULT_RUN_RETENTION_DAYS,
-  listRuns,
   readRunValue,
   runView,
-  sweepRuns,
 } from "../core/runs.js";
+import type { ExecutionStore } from "../core/storage.js";
 import type { FlowDefinition, FlowNode, PluginConfig, BranchNode, ConditionNode, LoopNode, ParallelNode } from "../core/types.js";
 
 // OpenClaw calls register() more than once per gateway process (every config
@@ -48,7 +47,7 @@ let retentionTimers: Array<ReturnType<typeof setTimeout>> = [];
 let sweeping = false;
 
 function armRetention(
-  stateDir: string,
+  store: ExecutionStore,
   retentionDays: number,
   logger?: { info: (msg: string) => void; warn: (msg: string) => void },
 ): void {
@@ -58,11 +57,11 @@ function armRetention(
   const sweep = () => {
     if (sweeping) return;
     sweeping = true;
-    sweepRuns(stateDir, retentionDays)
+    store.sweep(retentionDays)
       .then(({ indexed, runs, files }) => {
         if (indexed) logger?.info(`clawflow: indexed ${indexed} runs`);
         if (files) {
-          logger?.info(`clawflow: retention deleted ${runs} runs (${files} files) older than ${retentionDays} days`);
+          logger?.info(`clawflow: retention deleted ${runs} runs (${files} records) older than ${retentionDays} days`);
         }
       })
       .catch((err) => {
@@ -160,7 +159,7 @@ interface PluginApi {
   ) => void;
   config?: {
     plugins?: { entries?: Record<string, { config?: PluginConfig }> };
-    gateway?: { port?: number; host?: string };
+    gateway?: { port?: number; host?: string; auth?: { token?: string } };
     session?: { mainKey?: string };
     [key: string]: unknown;
   };
@@ -217,7 +216,7 @@ function register(api: PluginApi) {
     activeScheduler = scheduler;
     activeTriggerStore = triggerStore;
     scheduler.start();
-    armRetention(store.dir, pluginCfg.runRetentionDays ?? DEFAULT_RUN_RETENTION_DAYS, api.logger);
+    armRetention(store, pluginCfg.runRetentionDays ?? DEFAULT_RUN_RETENTION_DAYS, api.logger);
   }
 
   // ---- Flow server (optional) ---------------------------------------------------
@@ -228,6 +227,7 @@ function register(api: PluginApi) {
     startFlowServer({
       runner,
       serve: pluginCfg.serve,
+      controlToken: () => process.env.OPENCLAW_GATEWAY_TOKEN ?? api.config?.gateway?.auth?.token,
       // Same workspace the flow_* tools use, so a triggered run resolves the
       // published version exactly like flow_run does.
       workspace,
@@ -973,7 +973,7 @@ payload is passed as the output of the wait node and into flow state.`,
           payload?: unknown;
         },
       ) {
-        const delivered = sendEvent(
+        const delivered = runner.sendEvent(
           params.instanceId,
           params.eventType,
           params.payload ?? {},
@@ -1066,7 +1066,7 @@ Status values: running | completed | paused | waiting | failed | cancelled`,
         });
         try {
           if (params.instanceId) {
-            const record = store.get(params.instanceId);
+            const record = await store.get(params.instanceId);
             if (!record)
               return {
                 content: [
@@ -1081,7 +1081,7 @@ Status values: running | completed | paused | waiting | failed | cancelled`,
             }
             return { ...text(runView(record)), details: record };
           }
-          const page = listRuns(store.dir, {
+          const page = await store.listRuns({
             limit: params.limit,
             cursor: params.cursor,
             flow: params.flow,

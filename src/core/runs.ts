@@ -44,6 +44,8 @@ export type RunRow = RunIndexEntry;
 
 export interface RunPage {
   runs: RunRow[];
+  /** Oldest updated matching record, before cursor filtering; present only when requested. */
+  oldest?: { instanceId: string; updatedAt: string } | null;
   /** Runs matching the filters, across all pages. */
   total: number;
   /** Pass back as `cursor` for the next page; null on the last page. */
@@ -58,6 +60,8 @@ export interface ListRunsOptions {
   /** Only runs of this flow (the definition's `flow` name). */
   flow?: string;
   status?: string;
+  /** Include the oldest checkpoint identity across all matching records. */
+  includeOldest?: boolean;
 }
 
 /**
@@ -66,7 +70,7 @@ export interface ListRunsOptions {
  * pages never shift a page under it, and runs created in the same millisecond
  * are neither skipped nor repeated.
  */
-export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage {
+export function parseRunPage(opts: ListRunsOptions) {
   const limit = opts.limit ?? DEFAULT_PAGE;
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE) {
     throw new Error(`limit must be a whole number between 1 and ${MAX_PAGE}`);
@@ -76,21 +80,54 @@ export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage 
     throw new Error("cursor is not one this list returned; start again without it");
   }
 
+  return { limit, after };
+}
+
+export function listRuns(stateDir: string, opts: ListRunsOptions = {}): RunPage {
+  parseRunPage(opts);
   const rows: RunRow[] = [];
   for (const row of readTopLevelRows(stateDir)) {
     if (opts.flow && row.flowName !== opts.flow) continue;
     if (opts.status && row.status !== opts.status) continue;
     rows.push(row);
   }
+  return pageRunRows(rows, opts);
+}
+
+export function pageRunRows(rows: RunRow[], opts: ListRunsOptions = {}): RunPage {
+  const { limit, after } = parseRunPage(opts);
   rows.sort(newestFirst);
   const rest = after ? rows.filter((r) => newestFirst(r, after) > 0) : rows;
   const page = rest.slice(0, limit);
   const last = page[page.length - 1];
+  const oldest = opts.includeOldest ? rows.reduce<RunRow | undefined>((best, row) =>
+    !best || row.updatedAt < best.updatedAt || (row.updatedAt === best.updatedAt && row.instanceId < best.instanceId) ? row : best, undefined) : undefined;
   return {
+    ...(opts.includeOldest ? { oldest: oldest ? { instanceId: oldest.instanceId, updatedAt: oldest.updatedAt } : null } : {}),
     runs: page,
     total: rows.length,
     next_cursor: rest.length > limit && last ? encodeCursor(last) : null,
   };
+}
+
+export interface ListSubRunsOptions extends ListRunsOptions { node?: string }
+
+export function listSubRuns(stateDir: string, parentId: string, opts: ListSubRunsOptions = {}): RunPage {
+  parseRunPage(opts);
+  const rows: RunRow[] = [];
+  if (!fs.existsSync(stateDir)) return pageRunRows([], opts);
+  const prefix = `${parentId}:`;
+  const filePrefix = prefix.replace(/[^a-zA-Z0-9_-]/g, "_");
+  for (const file of fs.readdirSync(stateDir)) {
+    if (!file.startsWith(filePrefix) || !file.endsWith(".json")) continue;
+    const r = JSON.parse(fs.readFileSync(path.join(stateDir, file), "utf8")) as InstanceRecord;
+    if (!r.instanceId?.startsWith(prefix)) continue;
+    if (opts.node && r.instanceId.slice(prefix.length).split(":")[1] !== opts.node) continue;
+    if (opts.flow && r.flowName !== opts.flow) continue;
+    if (opts.status && r.status !== opts.status) continue;
+    rows.push(runIndexEntry(r));
+  }
+  return pageRunRows(rows, opts);
 }
 
 type Keyed = { createdAt: string; instanceId: string };
@@ -102,7 +139,7 @@ function newestFirst(a: Keyed, b: Keyed): number {
   return 0;
 }
 
-function encodeCursor(k: Keyed): string {
+export function encodeCursor(k: Keyed): string {
   return btoa(encodeURIComponent(JSON.stringify([k.createdAt, k.instanceId])));
 }
 
