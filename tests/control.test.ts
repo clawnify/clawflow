@@ -60,6 +60,20 @@ for (const backend of ["json", "sqlite", "postgres"] as const) {
       assert.equal(detail.run.subFlows.items.length, 20);
       assert.equal(detail.run.subFlows.items[0].iteration, 3);
       assert.equal(detail.run.subFlowsTruncated.items.total, 23);
+      assert.equal("running" in detail.run.subFlows.items[0], false, "no executing step is invented");
+      // A child executing its first step has no trace entry yet; its running
+      // step identifies it, without the agent session it runs in.
+      const live = "root_%:loop:live:0";
+      const running = { node: "fetch", do: "agent", startedAt: "2026-11-20T00:00:00.000Z", timeoutMs: 60000,
+        target: { agent: "main", sessionKey: "agent:main:private-session" } };
+      await store.create(live, "child", {});
+      await store.update(live, { running });
+      const liveDetail = await (await request("/root_%25?include_subruns=1&node=live")).json() as any;
+      assert.deepEqual(liveDetail.run.subFlows.live, [{ instanceId: live, iteration: 0, status: "running", trace: [],
+        completedNodes: {}, running: { node: "fetch", do: "agent", startedAt: running.startedAt, timeoutMs: 60000 } }]);
+      assert.ok(!JSON.stringify(liveDetail).includes("private-session"));
+      const liveChild = await (await request("/" + encodeURIComponent(live))).json() as any;
+      assert.deepEqual(liveChild.run.running, running, "a direct read keeps the full record");
       assert.equal((await request("?limit=101")).status, 400);
       assert.equal((await request("/missing")).status, 404);
       for (const approved of [true, false]) {

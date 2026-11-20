@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { FlowRunner } from "./runner.js";
-import type { FlowDefinition } from "./types.js";
+import type { FlowDefinition, RunningStep } from "./types.js";
 import { parseRunPage, readRunValue } from "./runs.js";
 import type { InstanceRecord, RunIndexEntry } from "./store.js";
 
@@ -132,11 +132,19 @@ async function runDetail(runner: FlowRunner, run: InstanceRecord, node?: string)
       const child = await store.get(row.instanceId);
       if (!child) throw new Error("Sub-run changed during detail read");
       subFlows[name].push({ instanceId: child.instanceId, iteration: iteration(row), status: child.status,
-        trace: child.trace ?? [], completedNodes: child.completedNodes ?? {} });
+        trace: child.trace ?? [], completedNodes: child.completedNodes ?? {},
+        ...(child.running ? { running: runningStep(child.running) } : {}) });
     }
     if (group.total > group.rows.length) omitted[name] = { total: group.total, returned: group.rows.length,
       omitted: group.total - group.rows.length, note: "Oldest iterations omitted. Read the paged subruns endpoint for every retained instance." };
   }
   return { ...run, subFlows, ...(node ? { subFlowsNodeFilter: node } : {}),
     ...(Object.keys(omitted).length ? { subFlowsTruncated: omitted } : {}) } as InstanceRecord;
+}
+
+/** A child's trace gains an entry only when a step ends, so its executing step
+ * is all that identifies a child before then. Detail lists many children: leave
+ * out the agent session `target`; a direct read of the child keeps it. */
+function runningStep(running: RunningStep): RunningStep {
+  return { node: running.node, do: running.do, startedAt: running.startedAt, timeoutMs: running.timeoutMs };
 }
