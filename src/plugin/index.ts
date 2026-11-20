@@ -9,6 +9,8 @@ import { TriggerScheduler, assertValidSchedule } from "../core/scheduler.js";
 import { validateFlow } from "../core/validate.js";
 import {
   publishDraft,
+  deleteFlow,
+  restoreFlow,
   listVersions as listVersionsCore,
   readLatestVersion as readLatestVersionCore,
   readVersion as readVersionCore,
@@ -477,8 +479,9 @@ All nodes require "name" and "do". Templates: {{ outputKey.field }}.`,
       name: "flow_delete",
       description: `Delete a flow file by moving it to the bin.
 
-The flow is not permanently removed — it is timestamped and moved to
-workspace/.clawflow/bin/ so it can be restored later with flow_restore_from_bin.
+The flow and its published versions are timestamped and moved to
+workspace/.clawflow/bin/ so they can be restored later with flow_restore_from_bin.
+Schedules are paused and run history is kept.
 Safe for agents to call without fear of data loss.`,
 
       parameters: {
@@ -517,18 +520,7 @@ Safe for agents to call without fear of data loss.`,
             content: [{ type: "text", text: `File not found: ${abs}` }],
           };
 
-        const binDir = path.join(base, ".clawflow", "bin");
-        fs.mkdirSync(binDir, { recursive: true });
-
-        const basename = path.basename(abs, ".json");
-        const ts = new Date().toISOString().replace(/[:.]/g, "-");
-        const binPath = path.join(binDir, `${basename}.${ts}.json`);
-
-        fs.renameSync(abs, binPath);
-
-        // Schedules outlive a soft delete, but must not keep firing at a flow
-        // that is no longer there. Paused, not removed, so a restore keeps them.
-        const pausedIds = triggerStore.pauseForFlow(path.basename(abs, ".json"));
+        const { file: binPath, pausedTriggers: pausedIds } = deleteFlow(base, params.file);
         const pausedNote =
           pausedIds.length > 0
             ? `\nPaused ${pausedIds.length} trigger(s) for this flow: ${pausedIds.join(", ")}`
@@ -555,8 +547,8 @@ Safe for agents to call without fear of data loss.`,
       description: `Restore a flow from the bin or list bin contents.
 
 Without "name", lists all flows in workspace/.clawflow/bin/ with their timestamps.
-With "name", restores the most recent version of that flow back to the flows/
-directory. If the flow file already exists, the restore is rejected.`,
+With "name", restores the most recent bin entry and its published versions.
+Schedules stay paused. If the flow already exists, the restore is rejected.`,
 
       parameters: {
         type: "object",
@@ -637,7 +629,7 @@ directory. If the flow file already exists, the restore is rejected.`,
             ],
           };
 
-        fs.renameSync(path.join(binDir, match), dest);
+        restoreFlow(base, match, prefix);
 
         return {
           content: [

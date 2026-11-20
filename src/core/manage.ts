@@ -1,5 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
+import { randomUUID } from "node:crypto";
+import { TriggerStore } from "./triggers.js";
 import type { FlowDefinition } from "./types.js";
 
 // ---- Draft / Version Management -------------------------------------------------
@@ -118,6 +120,51 @@ export function publishDraft(workspace: string, file: string): PublishResult {
     file: versionFile,
     totalVersions: nextVersion,
   };
+}
+
+/** Bin the draft and its published versions together; keep history and pause schedules. */
+export function deleteFlow(workspace: string, file: string): { file: string; pausedTriggers: string[] } {
+  const abs = resolveFlowFile(workspace, file);
+  if (!fs.existsSync(abs)) throw new Error(`Flow not found: ${file}`);
+  const name = path.basename(abs, ".json");
+  const binDir = path.join(workspace, ".clawflow", "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const bin = path.join(binDir, `${name}.${stamp}-${randomUUID()}.json`);
+  // Pause first: a failed move must not leave unattended runs firing.
+  const pausedTriggers = new TriggerStore(workspace).pauseForFlow(name);
+  fs.renameSync(abs, bin);
+  try {
+    const versions = versionsDir(workspace, name);
+    if (fs.existsSync(versions)) fs.renameSync(versions, `${bin}.versions`);
+  } catch (err) {
+    fs.renameSync(bin, abs);
+    throw err;
+  }
+  return { file: bin, pausedTriggers };
+}
+
+/** Restore a bin entry, including its published versions. Schedules stay paused. */
+export function restoreFlow(workspace: string, binFile: string, name: string): string {
+  if (path.basename(binFile) !== binFile || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    throw new Error("Invalid flow bin entry");
+  }
+  const source = path.join(workspace, ".clawflow", "bin", binFile);
+  const dest = resolveFlowFile(workspace, name);
+  const versions = versionsDir(workspace, name);
+  const savedVersions = `${source}.versions`;
+  if (fs.existsSync(dest) || (fs.existsSync(savedVersions) && fs.existsSync(versions))) {
+    throw new Error(`Cannot restore: flow ${name} already exists`);
+  }
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.renameSync(source, dest);
+  try {
+    if (fs.existsSync(savedVersions)) fs.renameSync(savedVersions, versions);
+  } catch (err) {
+    fs.renameSync(dest, source);
+    throw err;
+  }
+  return dest;
 }
 
 /**
