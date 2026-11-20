@@ -21,7 +21,8 @@
     "lint": "tsc --noEmit",
     "clean": "rm -rf dist",
     "migrate": "tsx scripts/migrate-to-1.0.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "migrate:storage": "tsx scripts/migrate-storage.ts"
   },
   "openclaw": {
     "extensions": [
@@ -46,7 +47,8 @@
     "skills/**/*",
     "openclaw.plugin.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/migrate-storage.ts"
   ],
   "keywords": [
     "openclaw",
@@ -72,6 +74,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.21.0",
     "typescript": "^5.5.0"
   },
@@ -87,6 +90,7 @@
     "url": "https://github.com/clawnify/clawflow/issues"
   },
   "dependencies": {
-    "croner": "^10.0.1"
+    "croner": "^10.0.1",
+    "pg": "^8.23.1"
   }
 }

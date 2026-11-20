@@ -549,6 +549,8 @@ export interface PluginConfig {
   memoryDir?: string;
   maxNodeDurationMs?: number;
   stateDir?: string; // where to persist flow state across restarts
+  /** Execution checkpoints and approvals. Defaults to the legacy JSON store. */
+  storage?: import("./storage.js").StorageConfig;
   /**
    * Days to keep finished runs (completed, failed, cancelled) in `stateDir`.
    * Older ones are deleted by a daily sweep in the serving process; running,

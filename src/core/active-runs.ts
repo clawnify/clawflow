@@ -21,7 +21,7 @@ const LIVE_RUNS_KEY = Symbol.for("@clawnify/clawflow/live-runs");
 type LiveRunsHolder = { [LIVE_RUNS_KEY]?: Map<string, LiveRun> };
 const holder = globalThis as unknown as LiveRunsHolder;
 
-/** instanceId of a top-level run -> its live state, for runs in this process. */
+/** Storage identity + instanceId -> live state, for runs in this process. */
 export const liveRuns: Map<string, LiveRun> = holder[LIVE_RUNS_KEY] ?? (holder[LIVE_RUNS_KEY] = new Map());
 
 /** The error a cancelled step and run end with. */

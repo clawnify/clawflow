@@ -562,11 +562,11 @@ Strongly recommended on `do: http` and `do: ai` nodes. Do not use on `do: wait` 
 
 ## Flow State and Durability
 
-Every flow run gets a unique `instanceId`. The runner persists state after every completed node to `~/.openclaw/flow-state/<instanceId>.json`.
+Every flow run gets a unique `instanceId`. The runner persists state after every completed node. JSON files in `stateDir` remain the default; native SQLite and PostgreSQL are explicit alternatives. All three store checkpoints, memoized outputs, traces, the running step and pending approvals.
 
 **What this means in practice:**
 
-- Gateway restarts mid-flow? Already-completed nodes are not re-run. The flow resumes from the last checkpoint.
+- A paused flow can be explicitly resumed after a gateway restart, using its stored checkpoint.
 - A node that took 30 seconds to run won't run again on resume — its memoized output is loaded from disk.
 - An approval-gated flow can stay paused for days. The state survives indefinitely.
 
@@ -574,9 +574,170 @@ Every flow run gets a unique `instanceId`. The runner persists state after every
 
 **Cancelling a run.** `flow_cancel { instanceId }`, or `POST /flows/runs/:instanceId/cancel` on the flow server (optional body `{ "reason": "..." }`), stops a run that has not finished. A run executing in the process stops on the step it is on: an agent step's `openclaw agent` process gets SIGTERM, on which the CLI aborts its turn in the gateway; an exec step's command is stopped with its whole process group; http and ai steps are aborted; a custom step gets `ctx.abortSignal` and is abandoned if it ignores it. The run ends with status `cancelled`, the interrupted step's trace entry too, and nothing after it runs. A run paused at an approval gate, or left `running` by a restart, is marked cancelled and its approval dropped; a runner in another process that still holds a run stops before its next step. The route answers 404 (`run_not_found`) for an unknown run and 409 (`run_finished`) for a finished one. Each attempt of a step is stopped the same way when it times out, before any retry starts; an agent step with no `timeout` gets 120 s per attempt.
 
-**Reading runs.** `flow_status` lists runs newest first, 20 per page (`limit`, then `cursor` from the previous page). One run comes back whole when it is small, and otherwise as a summary: status, error, each state key with its size, and the trace without outputs. Read any single value with `path`, e.g. `state.leads` or `trace.3.output`; arrays and long strings come back a page at a time (`offset`, `limit`). `flow_run` and `flow_resume` return the same summary when a run is too large to read in one tool result. The same functions (`listRuns`, `summarizeRun`, `readRunValue`, `sweepRuns`) are exported for other hosts. A small summary of each run is kept in `flow-state/_index/`, so a list reads a few hundred bytes per run instead of parsing every record; an entry older than its record is ignored, and the daily sweep fills in missing ones.
+**Reading runs.** `flow_status` lists runs newest first, 20 per page (`limit`, then `cursor` from the previous page). One run comes back whole when it is small, and otherwise as a summary: status, error, each state key with its size, and the trace without outputs. Read any single value with `path`, e.g. `state.leads` or `trace.3.output`; arrays and long strings come back a page at a time (`offset`, `limit`). `flow_run` and `flow_resume` return the same summary when a run is too large to read in one tool result. The same functions (`listRuns`, `summarizeRun`, `readRunValue`, `sweepRuns`) are exported for other hosts. With JSON storage, a small summary of each run is kept in `flow-state/_index/`, so a list reads a few hundred bytes per run instead of parsing every record; an entry older than its record is ignored, and the daily sweep fills in missing ones.
 
-This is the lightweight equivalent of Cloudflare Durable Objects' memoization. Cloudflare does it at the infrastructure level with global durability. We do it at the file system level for local/self-hosted use.
+### SQLite and PostgreSQL
+
+Set `storage` in `plugins.entries.clawflow.config` (OpenClaw), or in the config
+passed to `new FlowRunner(config)` (standalone). No configuration means JSON;
+`{ "backend": "json" }` selects it explicitly.
+
+```json
+{
+  "stateDir": "/path/to/flow-state",
+  "storage": { "backend": "sqlite" }
+}
+```
+
+SQLite uses Node's built-in `node:sqlite`, requiring **[Node 22.13+](https://nodejs.org/en/blog/release/v22.13.0)**. It creates
+`stateDir/clawflow.sqlite`, or the file supplied as `storage.path`. Keep it on a
+local filesystem. WAL, full synchronization and a 5-second busy timeout are
+configured on each connection. New database files are mode `0600`. Back up the
+SQLite database with a SQLite-aware backup tool, or stop every connection before
+copying it; copying just the main file while WAL writers are active can lose
+checkpoints.
+
+```json
+{
+  "storage": {
+    "backend": "postgres",
+    "connectionStringEnv": "CLAWFLOW_DATABASE_URL",
+    "namespace": "my-agent"
+  }
+}
+```
+
+Set that environment variable through your deployment's secret manager to a
+PostgreSQL connection URL. The URL is never written into a checkpoint. TLS options
+are those of [node-postgres](https://node-postgres.com/features/ssl); require
+certificate verification for remote connections. PostgreSQL is loaded only when
+selected and uses at most four pooled connections per store. Empty configuration,
+connection failures and unsupported schema versions fail the operation; they
+never silently fall back to local files.
+
+Use a stable, distinct namespace for each independent installation sharing a
+database. **A namespace separates keys, not permissions.** Use dedicated database
+roles and databases or schema grants to isolate untrusted installations. The
+configured role needs permission to create and use the `clawflow_*` tables and
+indexes in its search path. Initial schema creation is transactional and versioned.
+
+SQL backends commit each step's checkpoint, memo and summary together; a pause
+also commits its pending approval. Resume claims the paused run and consumes its
+approval in one transaction, so competing resumes cannot both claim it. Run lists
+read indexed summaries and use the same cursor/filter contract; retention deletes
+finished roots, their child records and approvals. A new run cannot overwrite an
+existing SQL run ID. `:` is reserved for engine-generated child IDs.
+
+Flow definitions, published versions, trigger schedules and `do: memory` files
+remain in the workspace. This is execution storage, not a central history mirror
+or a distributed scheduler. Event waiters and immediate cancellation remain
+process-local (use `runner.sendEvent()` to select the store); another process's cancellation is observed at the next step.
+Changing storage does not add automatic recovery of an interrupted running step
+or exactly-once external side effects. Full checkpoint payloads are still rewritten
+at each step; the SQL indexes bound list payloads, not individual checkpoint size.
+
+### Reading and closing a configured store
+
+The existing `StateStore`, `listRuns(stateDir)` and `sweepRuns(stateDir, days)`
+exports keep their JSON-file behavior. Database-aware consumers must use the
+configured store. Always await the methods on it, including those on `runner.getStore()` and
+`runner.listApprovals()`; JSON implementations can return synchronously.
+
+```ts
+import { createStateStore, readRunValue } from "@clawnify/clawflow";
+
+const store = createStateStore(config.stateDir, config.storage);
+try {
+  const page = await store.listRuns({ limit: 20, status: "paused" });
+  if (page.runs[0]) {
+    const run = await store.get(page.runs[0].instanceId);
+    if (run) console.log(readRunValue(run, "state.inputs"));
+  }
+} finally {
+  await store.close();
+}
+```
+
+`store.listSubRuns(parentId, { limit, cursor, node?, flow?, status? })` pages
+all retained descendants, preserving their actual `:`-separated IDs. `node`
+filters the immediate node beneath that parent, including its nested descendants.
+It uses the same `(createdAt DESC, instanceId DESC)` order as `listRuns`.
+SQL count and page share one read transaction; different pages and `get` calls
+do not share a snapshot. JSON readers have no snapshot. Neither API provides an
+update cursor, revision, complete inventory guarantee, or deletion tombstones.
+
+When the HTTP listener is enabled, authenticated management routes use the
+same configured runner:
+
+- `GET /flows/runs?limit=20&cursor=...&flow=...&status=...`.
+  Optional `include_oldest=1` adds `oldest: { instanceId, updatedAt } | null`
+  across all matching runs, before cursor filtering. The store option is
+  `includeOldest: true`. SQL count, oldest checkpoint and page share one
+  transaction; this identifies old checkpoints without declaring runs dead.
+- `GET /flows/runs/:instanceId` for the complete record; optional `path`, `offset`,
+  `limit`, `max_chars` use `readRunValue`. URL-encode actual instance IDs.
+- `GET /flows/runs/:instanceId/subruns?limit=20&node=...` for descendant summaries.
+- `GET /flows/runs/:instanceId?include_subruns=1&node=...` adds the last 20
+  iterations per node and counts of omitted iterations for detail views.
+- `POST /flows/runs/:instanceId/resume` with `{ "approved": true }` or `false`.
+  Approval resolves the definition through `resolveRunnableFlow` (published
+  version preferred); decline atomically cancels and consumes its approval.
+  A 202 is sent only after the durable resume claim, before later steps finish.
+
+The configured listener prefix replaces `/flows`. These new routes require
+`Authorization: Bearer <OPENCLAW_GATEWAY_TOKEN>` (or the host gateway's configured
+token; standalone hosts may supply `controlToken` to `startFlowServer`). Without
+a token they refuse access. Optional `X-ClawFlow-Backend: sqlite|postgres|json`
+refuses a stale runner whose backend differs from the caller's configuration.
+Storage errors return 503 without credentials or a JSON fallback. The existing
+run/trigger/cancel routes retain their prior authentication contract.
+
+Run records do not yet bind an executed definition version/hash or trusted
+actor/session access scope. Keep the relevant definition unchanged while a run
+is paused. Do not infer historical provenance or access grants from missing
+fields. Management reads are operator access, not a per-user authorization layer.
+
+For a standalone runner, call `await runner.close()` once its runs have settled.
+This closes the SQLite handle or PostgreSQL pool. Close a reader when it is no
+longer needed; avoid opening a new pool for each request in a long-lived host.
+
+### Importing existing JSON state
+
+There is no automatic conversion on startup. Before switching storage:
+
+1. Stop **every** ClawFlow writer, including the gateway, flow HTTP service and
+   scheduler. Keep the original state directory as the backup.
+2. From a source checkout with dependencies installed, run one of:
+
+   ```sh
+   npm run migrate:storage -- --writers-stopped --source /path/to/flow-state --sqlite /path/to/flow-state/clawflow.sqlite
+   npm run migrate:storage -- --writers-stopped --source /path/to/flow-state --postgres-env CLAWFLOW_DATABASE_URL --namespace my-agent
+   ```
+
+3. Verify the imported runs and approvals using `createStateStore`. Update every
+   reader as well as the runner to use the same storage configuration, then restart.
+
+The importer copies all run records, including child runs, and pending approvals;
+it ignores the derived `_index` directory. It never modifies or removes the JSON
+source. Each run and its approvals commit atomically, bounded by one record at a
+time. Identical records are accepted on retry; different destination records,
+malformed JSON and orphaned approvals stop the import. Earlier committed runs
+remain after an error, so repair the source while stopped and retry before
+starting the destination. Do not import again after the destination has begun
+executing: it will correctly refuse newer, conflicting records. Switching back
+to old JSON files after SQL writes would lose those newer checkpoints; this
+command does not export SQL back to JSON.
+
+The same importer is exported as `importJsonState(sourceDir, storageConfig)` for
+hosts managing a stopped runtime. It copies execution state only; retain the
+workspace's definitions, versions, schedules and memory files too.
+
+### Storage tests
+
+Run `npm test` on Node 22.13+ for JSON and native SQLite. Set
+`CLAWFLOW_TEST_POSTGRES_URL` to an **isolated test database** to include the real
+PostgreSQL suite. Tests create tables and records there. CI provisions PostgreSQL
+16 and runs all three backends; production credentials are never needed.
 
 ---
 
