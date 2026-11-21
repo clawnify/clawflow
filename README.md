@@ -222,7 +222,7 @@ Runs a task through a real OpenClaw agent with full tool access (browser, exec, 
 }
 ```
 
-On OpenClaw, this delegates to `openclaw agent --agent <id> --message "..."`. The agent gets full tool access — browser, shell, file system, memory, MCP. Falls back to a single AI call if the CLI is unavailable (standalone mode).
+On OpenClaw, this delegates to `openclaw agent --agent <id> --timeout <seconds> --message "..."`. The agent gets full tool access — browser, shell, file system, memory, MCP. Falls back to a single AI call if the CLI is unavailable (standalone mode).
 
 | Field | Description |
 |---|---|
@@ -230,6 +230,7 @@ On OpenClaw, this delegates to `openclaw agent --agent <id> --message "..."`. Th
 | `agent` | OpenClaw agent ID (e.g. `"main"`, `"ops"`). Uses config `defaultAgent` or `"main"` if omitted. |
 | `input` | Dotted path to context passed with the task |
 | `tools` | Hint for non-OpenClaw runtimes (OpenClaw agents have their own tool policy) |
+| `timeout` | How long the turn may run (default 120 s). The step's limit and the turn's limit in OpenClaw. See [Time Limits](#time-limits). |
 
 The distinction between `ai` and `agent` is intentional:
 - `do: ai` = deterministic, one-shot, structured output — use for classification, drafting, extraction
@@ -557,6 +558,24 @@ Any node can define per-node retry behavior. Learned directly from Cloudflare's 
 | `backoff` | `constant`, `linear`, `exponential` | `constant` |
 
 Strongly recommended on `do: http` and `do: ai` nodes. Do not use on `do: wait` — retrying approval gates makes no sense.
+
+---
+
+## Time Limits
+
+`timeout` on a node is how long one attempt of it may run (`"30s"`, `"5m"`, `"2h"`). When it runs out, the attempt is stopped the way a cancel stops a step, and the next retry starts or the run fails with `Node "<name>" timed out after <ms>ms`.
+
+| Node | Limit when `timeout` is not set |
+|---|---|
+| `agent` | 120 s |
+| `condition`, `branch`, `loop`, `parallel` | None. Each step inside keeps its own limit. |
+| `sleep` | None. It lasts its `duration`. |
+| `wait` | None. An event wait expires after 24 h; an approval expires after 24 h. |
+| Any other step | 30 s |
+
+`maxNodeDurationMs` in the plugin config replaces the 30 s and 120 s defaults. A `timeout` set on a container caps everything inside it; on a loop, all its iterations together.
+
+An agent step's limit is also its turn's limit in OpenClaw: the runner passes it to `openclaw agent` as `--timeout`, in seconds rounded up. Without it, OpenClaw would end the turn after `agents.defaults.timeoutSeconds`, or 600 s when that is unset, however long the step allows. A turn that can take 40 minutes needs `"timeout": "1h"` on its step and nothing in `openclaw.json`.
 
 ---
 

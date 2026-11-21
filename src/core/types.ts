@@ -422,8 +422,9 @@ export interface RunningStep {
   do: string;
   startedAt: string;
   /** How long one attempt may run before it fails, so a reader can say how
-   *  long the step may still wait. */
-  timeoutMs: number;
+   *  long the step may still wait. Absent when the step has no limit of its
+   *  own: a container, sleep or wait without `timeout`. */
+  timeoutMs?: number;
   /** Agent steps: the resolved session the step runs in. Its turn waits for
    *  any turn already running in that session. */
   target?: { agent?: string; sessionKey?: string; sessionId?: string };
@@ -547,6 +548,10 @@ export interface PluginConfig {
    */
   defaultProvider?: string;
   memoryDir?: string;
+  /** Default limit for one step without its own `timeout`, for every step
+   *  type (unset: 30000, or 120000 for agent steps). Containers (condition,
+   *  branch, loop, parallel), sleep and wait never get a default: the steps
+   *  inside a container keep their own limits. */
   maxNodeDurationMs?: number;
   stateDir?: string; // where to persist flow state across restarts
   /** Execution checkpoints and approvals. Defaults to the legacy JSON store. */

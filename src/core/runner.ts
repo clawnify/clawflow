@@ -123,6 +123,13 @@ function applyFilter(val: unknown, filter: string): unknown {
 
 // ---- Runner ---------------------------------------------------------------------
 
+/** Steps with no default time limit, only the `timeout` set on them. A
+ *  container (condition, branch, loop, parallel) runs steps that each have
+ *  their own limit, and a default around all of them stopped a loop of long
+ *  agent steps at 30 s. A sleep lasts its `duration`, and a wait for an event
+ *  has its own 24 h default. */
+const NO_DEFAULT_TIMEOUT: ReadonlySet<string> = new Set(["condition", "branch", "loop", "parallel", "sleep", "wait"]);
+
 export class FlowRunner {
   private cfg: PluginConfig;
   private store: ExecutionStore;
@@ -597,7 +604,7 @@ export class FlowRunner {
     for (let attempt = 1; attempt <= policy.limit; attempt++) {
       if (signal.aborted) throw abortReason(signal);
       const { controller, dispose } = childController(signal);
-      const timer = setTimeout(
+      const timer = nodeTimeoutMs === undefined ? undefined : setTimeout(
         () => controller.abort(new Error(`Node "${node.name}" timed out after ${nodeTimeoutMs}ms`)),
         nodeTimeoutMs,
       );
@@ -623,11 +630,13 @@ export class FlowRunner {
     throw lastError;
   }
 
-  /** How long one attempt of a step may run before it fails and is stopped.
+  /** How long one attempt of a step may run before it fails and is stopped, or
+   *  undefined when it has no limit of its own (see NO_DEFAULT_TIMEOUT).
    *  An agent step defaults to the 120 s its `openclaw agent` process always
    *  had: with 30 s here the step failed while its turn ran on in the gateway. */
-  private nodeTimeoutMs(node: FlowNode): number {
+  private nodeTimeoutMs(node: FlowNode): number | undefined {
     if (node.timeout) return parseDuration(node.timeout);
+    if (NO_DEFAULT_TIMEOUT.has(node.do)) return undefined;
     return this.cfg.maxNodeDurationMs ?? (node.do === "agent" ? 120_000 : 30_000);
   }
 
@@ -1160,9 +1169,8 @@ export class FlowRunner {
         ? `${task}\n\nContext:\n${typeof input === "object" ? JSON.stringify(input, null, 2) : String(input)}`
         : task;
 
-    const timeoutMs = node.timeout
-      ? parseDuration(node.timeout)
-      : undefined;
+    // The limit runWithRetry puts on this step. An agent step always has one.
+    const timeoutMs = this.nodeTimeoutMs(node)!;
 
     const target = {
       // new names win; agentId/session are accepted as deprecated aliases
@@ -1217,7 +1225,7 @@ export class FlowRunner {
     message: string,
     target: { agent?: string; sessionKey?: string; sessionId?: string; channel?: string },
     state: FlowState,
-    nodeTimeoutMs?: number,
+    timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<string> {
     const { execFile } = await import("child_process");
@@ -1232,7 +1240,12 @@ export class FlowRunner {
     }
 
     if (signal?.aborted) throw abortReason(signal);
-    const args = ["agent", ...this.buildAgentArgs(target), "--message", message];
+    // Without --timeout, OpenClaw stops the turn after agents.defaults.timeoutSeconds,
+    // or 600 s when that is unset, however long the step may run. Pass the
+    // step's own limit, rounded up so the runner's timer still fires first and
+    // fails the step with its own message. Never 0, which means no limit.
+    const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+    const args = ["agent", ...this.buildAgentArgs(target), "--timeout", String(timeoutSeconds), "--message", message];
 
     // Merge flow-level env vars (state.env) into the child process environment.
     // Set CLAWFLOW_NO_SERVE to prevent the child from binding the webhook port.
@@ -1248,7 +1261,7 @@ export class FlowRunner {
       // sending chat.abort for the turn it started, so the turn stops in the
       // gateway too instead of running on (or staying queued) without the flow.
       const { stdout } = await execFileAsync("openclaw", args, {
-        timeout: nodeTimeoutMs ?? this.cfg.maxNodeDurationMs ?? 120_000,
+        timeout: timeoutMs,
         maxBuffer: 10 * 1024 * 1024, // 10MB
         env,
         signal,
