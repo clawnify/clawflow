@@ -184,14 +184,16 @@ export class TriggerScheduler {
         record.cron,
         {
           timezone: record.tz,
-          // Never start a run while the previous one is still going.
+          // Never start a run while the previous one is still going. croner
+          // only knows a run is going while the callback's promise is pending,
+          // so the callback must return it.
           protect: true,
           // Don't hold the process open on our account.
           unref: true,
           catch: true,
         },
-        () => {
-          void this.fire(record);
+        async () => {
+          await this.fire(record);
         },
       );
     } catch (err) {
