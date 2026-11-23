@@ -48,6 +48,16 @@ import {
   type LiveRun,
 } from "./active-runs.js";
 import type { FlowStatus } from "./types.js";
+import {
+  engineOwner,
+  holdLease,
+  leaseSettled,
+  reconcileRuns,
+  runDropped,
+  type ReconcileOptions,
+  type ReconcileResult,
+} from "./ownership.js";
+import type { InstanceRecord } from "./store.js";
 
 // ---- Built-in AI providers ------------------------------------------------------
 // Selectable by name from an `ai` node's `provider` field (or cfg.defaultProvider).
@@ -154,6 +164,7 @@ export class FlowRunner {
     if ([...liveRuns.keys()].some((key) => key.startsWith(`${this.store.identity}\0`))) {
       throw new Error("Cannot close storage while flows are running");
     }
+    await leaseSettled(this.store);
     await this.store.close();
   }
 
@@ -227,9 +238,19 @@ export class FlowRunner {
     }
     const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
     liveRuns.set(this.runKey(id), live);
+    let release: (() => void) | undefined;
     try {
+      // Before the record exists: it names this process as the run's owner,
+      // and the store must have heard from the process by then (ownership.ts).
+      release = await holdLease(this.store);
       return await this.startRun(flow, input, id, state, live);
+    } catch (err) {
+      // A store write failed, possibly after the record was created: it may
+      // say "running" under this process with nothing executing it.
+      if (release) runDropped(this.store);
+      throw err;
     } finally {
+      release?.();
       if (liveRuns.get(this.runKey(id)) === live) liveRuns.delete(this.runKey(id));
     }
   }
@@ -251,7 +272,7 @@ export class FlowRunner {
       }
       if (missing.length > 0) {
         const error = `Missing required input${missing.length > 1 ? "s" : ""}: ${missing.join(", ")}`;
-        await this.store.create(id, flow.flow, state);
+        await this.store.create(id, flow.flow, state, engineOwner);
         await this.store.update(id, { status: "failed", error });
         return {
           ok: false, status: "failed", flowName: flow.flow ?? "unknown",
@@ -261,7 +282,7 @@ export class FlowRunner {
     }
 
     // Create state record first — ensures a state file exists even if env resolution fails
-    await this.store.create(id, flow.flow, state);
+    await this.store.create(id, flow.flow, state, engineOwner);
 
     // Seed state.env: flow defaults → shell-expand $(…) → process.env overrides
     if (flow.env) {
@@ -347,35 +368,70 @@ export class FlowRunner {
     approvedOrPayload: boolean | unknown = true,
     onClaimed?: (instanceId: string) => void,
   ): Promise<FlowResult> {
-    let pausedAtIndex = 0;
-    // Pure transform under the store's transaction/lock: competing resumes
-    // cannot both claim the pause, and a failed write keeps the approval.
-    const record = await this.store.resume(token, (current) => {
-      if (current.status !== "paused" && current.status !== "waiting") {
-        throw new Error(`Instance "${current.instanceId}" is not paused (status: ${current.status})`);
-      }
-      pausedAtIndex = current.pausedAtIndex ?? 0;
-      const trace = current.trace ?? [];
-      const declined = typeof approvedOrPayload === "boolean" && !approvedOrPayload;
-      const pausedNode = flow.nodes[pausedAtIndex];
-      if (declined) {
-        const entry = trace.find((t) => t.status === "paused");
-        if (entry) entry.status = "skipped";
-      } else if (pausedNode) {
-        const isApproval = pausedNode.do === "wait" && (pausedNode as WaitNode).for === "approval";
-        const output = isApproval ? { approved: true, approvedAt: new Date().toISOString(), token } : approvedOrPayload;
-        current.completedNodes[pausedNode.name] = output;
-        if (pausedNode.output) current.state[pausedNode.output] = output;
-        const entry = trace.find((t) => t.node === pausedNode.name && t.status === "paused");
-        if (entry) { entry.status = "ok"; entry.output = output; }
-      }
-      return { ...current, trace, status: declined ? "cancelled" : "running", resumeToken: undefined, waitingFor: undefined, pausedAtIndex: undefined };
-    });
-    onClaimed?.(record.instanceId);
-    if (record.status === "cancelled") {
-      return { ok: true, status: "cancelled", flowName: record.flowName, instanceId: record.instanceId, state: record.state, trace: record.trace, error: "Flow cancelled at approval gate" };
+    // The run is this process's from the claim below until it ends.
+    const release = await holdLease(this.store);
+    try {
+      return await this.resumeHeld(token, flow, approvedOrPayload, onClaimed);
+    } finally {
+      release();
     }
-    return this.executeRun(flow, record.state, record.instanceId, pausedAtIndex + 1, record.trace);
+  }
+
+  private async resumeHeld(
+    token: string,
+    flow: FlowDefinition,
+    approvedOrPayload: boolean | unknown,
+    onClaimed?: (instanceId: string) => void,
+  ): Promise<FlowResult> {
+    let pausedAtIndex = 0;
+    // Like a new run (runFlow), a resumed one is live in this process before
+    // its record says "running" under it, so a reconcile pass never finds a
+    // run that names this process and is not executing here.
+    const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
+    let claimed: string | undefined;
+    try {
+      // Pure transform under the store's transaction/lock: competing resumes
+      // cannot both claim the pause, and a failed write keeps the approval.
+      const record = await this.store.resume(token, (current) => {
+        if (current.status !== "paused" && current.status !== "waiting") {
+          throw new Error(`Instance "${current.instanceId}" is not paused (status: ${current.status})`);
+        }
+        pausedAtIndex = current.pausedAtIndex ?? 0;
+        const trace = current.trace ?? [];
+        const declined = typeof approvedOrPayload === "boolean" && !approvedOrPayload;
+        const pausedNode = flow.nodes[pausedAtIndex];
+        if (declined) {
+          const entry = trace.find((t) => t.status === "paused");
+          if (entry) entry.status = "skipped";
+        } else if (pausedNode) {
+          const isApproval = pausedNode.do === "wait" && (pausedNode as WaitNode).for === "approval";
+          const output = isApproval ? { approved: true, approvedAt: new Date().toISOString(), token } : approvedOrPayload;
+          current.completedNodes[pausedNode.name] = output;
+          if (pausedNode.output) current.state[pausedNode.output] = output;
+          const entry = trace.find((t) => t.node === pausedNode.name && t.status === "paused");
+          if (entry) { entry.status = "ok"; entry.output = output; }
+        }
+        if (!declined) {
+          claimed = current.instanceId;
+          liveRuns.set(this.runKey(claimed), live);
+        }
+        return { ...current, trace, status: declined ? "cancelled" : "running", ...(declined ? {} : { owner: engineOwner, claim: crypto.randomUUID() }), resumeToken: undefined, waitingFor: undefined, pausedAtIndex: undefined };
+      });
+      onClaimed?.(record.instanceId);
+      if (record.status === "cancelled") {
+        return { ok: true, status: "cancelled", flowName: record.flowName, instanceId: record.instanceId, state: record.state, trace: record.trace, error: "Flow cancelled at approval gate" };
+      }
+      return await this.executeRun(flow, record.state, record.instanceId, pausedAtIndex + 1, record.trace, live);
+    } catch (err) {
+      // Claimed, then not executed to an end (`onClaimed` threw, or a store
+      // write did): the record may say "running" under this process.
+      if (claimed) runDropped(this.store);
+      throw err;
+    } finally {
+      // executeRun has removed it by now; this covers a claim that did not
+      // get that far.
+      if (claimed && liveRuns.get(this.runKey(claimed)) === live) liveRuns.delete(this.runKey(claimed));
+    }
   }
 
   // ---- Cancel -------------------------------------------------------------------
@@ -389,9 +445,9 @@ export class FlowRunner {
    * the turn it started in the gateway; exec, http and ai steps are killed or
    * aborted; a custom step gets `ctx.abortSignal` and is abandoned if it ignores
    * it. Any other unfinished run (paused at an approval, or left running by a
-   * process that has since exited) is marked cancelled on its record. A runner
-   * in another process that still holds such a run stops before its next step
-   * and keeps that status.
+   * process that has since exited and not yet failed by reconcile()) is marked
+   * cancelled on its record. A runner in another process that still holds such
+   * a run stops before its next step and keeps that status.
    */
   async cancel(instanceId: string, reason = "Cancelled"): Promise<CancelResult> {
     const live = liveRuns.get(this.runKey(instanceId));
@@ -414,6 +470,9 @@ export class FlowRunner {
       ]);
       clearTimeout(bound);
       const status = (await this.store.get(instanceId))?.status ?? "cancelled";
+      // It had been failed from outside while it executed here: it has stopped
+      // now, and that end stands.
+      if (status === "failed") return { ok: false, instanceId, error: "finished", status };
       return { ok: true, instanceId, status: status === "cancelled" ? "cancelled" : "cancelling" };
     }
 
@@ -422,7 +481,7 @@ export class FlowRunner {
     const paused = trace.find((t) => t.status === "paused");
     if (paused) paused.status = "cancelled";
     if (current.resumeToken) await this.store.resolveApproval(current.resumeToken);
-    await this.store.update(instanceId, {
+    const ended = await this.store.update(instanceId, {
       status: "cancelled",
       error: reason,
       trace,
@@ -431,6 +490,8 @@ export class FlowRunner {
       waitingFor: undefined,
       pausedAtIndex: undefined,
     });
+    // A reconcile pass failed it between the read above and this write.
+    if (ended.status === "failed") return { ok: false, instanceId, error: "finished", status: "failed" };
     return { ok: true, instanceId, status: "cancelled" };
   }
 
@@ -442,11 +503,10 @@ export class FlowRunner {
     instanceId: string,
     startIndex: number,
     priorTrace: TraceEntry[],
-    held?: LiveRun,
+    live: LiveRun,
   ): Promise<FlowResult> {
-    // A new run registered itself before its first await (runFlow); a resumed
-    // run registers here.
-    const live: LiveRun = held ?? { controller: new AbortController(), flowName: flow.flow };
+    // A new run registered itself before its first await (runFlow), a resumed
+    // one as it claimed the pause (resumeHeld).
     liveRuns.set(this.runKey(instanceId), live);
     try {
       const done = this.execute(flow, state, instanceId, startIndex, priorTrace, live.controller.signal);
@@ -466,16 +526,65 @@ export class FlowRunner {
     reason?: string,
   ): Promise<FlowResult> {
     const error = reason || "Cancelled";
-    await this.store.update(instanceId, { status: "cancelled", state, trace, error, running: undefined });
+    const ended = await this.store.update(instanceId, { status: "cancelled", state, trace, error, running: undefined });
+    // The store keeps a run that had already failed (isSettledFailure).
+    const failed = this.failedOutside(instanceId, ended);
+    if (failed) return this.endFailedOutside(flow, state, instanceId, trace, failed);
     return { ok: false, status: "cancelled", flowName: flow.flow, instanceId, state, trace, error };
   }
 
-  /** A top-level run whose record was marked cancelled from outside this
-   *  process while it ran. Sub-flow records are never marked that way. */
-  private async cancelledOnRecord(instanceId: string): Promise<string | undefined> {
-    if (instanceId.includes(":")) return undefined;
+  /**
+   * The error of a top-level run that a reconcile pass failed while it was
+   * executing here, having taken this process for gone (ownership.ts). The
+   * execution only writes "failed" as it returns, so reading it mid-run means
+   * it came from outside. That end stands: a finished run does not change
+   * again. A sub-flow record is different: a failed one is run once more when
+   * its parent retries.
+   */
+  private failedOutside(instanceId: string, record: InstanceRecord | null | undefined): string | undefined {
+    if (!record || instanceId.includes(":") || record.status !== "failed") return undefined;
+    return record.error || "Interrupted";
+  }
+
+  /**
+   * A step inside a loop, branch, condition or parallel belongs to a top-level
+   * run that may have been ended from outside since the container started:
+   * cancelled by another process, or failed by a reconcile pass. The top-level
+   * steps see that on their own record; without this, a loop would run every
+   * remaining iteration first. Read from the run's summary, so it costs the
+   * same however much the run has produced. Ending is done by aborting the
+   * run in this process, which stops every step in it and skips retries.
+   */
+  private async stopIfRunEnded(subInstanceId: string): Promise<void> {
+    const rootId = subInstanceId.slice(0, subInstanceId.indexOf(":"));
+    const root = await this.store.summary(rootId);
+    if (root?.status !== "cancelled" && root?.status !== "failed") return;
+    const live = liveRuns.get(this.runKey(rootId));
+    if (live && !live.controller.signal.aborted) {
+      live.controller.abort(new FlowCancelledError(root.error || (root.status === "failed" ? "Interrupted" : "Cancelled")));
+    }
+  }
+
+  /** Stop executing a run that was failed from outside. Nothing is written:
+   *  its record already says how it ended. */
+  private endFailedOutside(
+    flow: FlowDefinition,
+    state: FlowState,
+    instanceId: string,
+    trace: TraceEntry[],
+    error: string,
+  ): FlowResult {
+    return { ok: false, status: "failed", flowName: flow.flow, instanceId, state, trace, error };
+  }
+
+  /** How a top-level run was ended from outside this execution while it ran:
+   *  marked cancelled, or failed by a reconcile pass. Sub-flow records are
+   *  never ended that way. */
+  private async endedOnRecord(instanceId: string): Promise<{ cancelled?: string; failed?: string }> {
+    if (instanceId.includes(":")) return {};
     const record = await this.store.get(instanceId);
-    return record?.status === "cancelled" ? (record.error || "Cancelled") : undefined;
+    if (record?.status === "cancelled") return { cancelled: record.error || "Cancelled" };
+    return { failed: this.failedOutside(instanceId, record) };
   }
 
   // ---- Core execution loop ------------------------------------------------------
@@ -498,10 +607,13 @@ export class FlowRunner {
 
       // One read per step: whether the run was cancelled, and the memo below.
       const record = await this.store.get(instanceId);
+      if (!signal.aborted && instanceId.includes(":")) await this.stopIfRunEnded(instanceId);
       if (signal.aborted) return this.endCancelled(flow, state, instanceId, trace, abortReason(signal).message);
       if (record?.status === "cancelled" && !instanceId.includes(":")) {
         return this.endCancelled(flow, state, instanceId, trace, record.error);
       }
+      const failedOutside = this.failedOutside(instanceId, record);
+      if (failedOutside) return this.endFailedOutside(flow, state, instanceId, trace, failedOutside);
 
       // ---- Durable memoization: skip already-completed nodes --------------------
       const memo = record && Object.prototype.hasOwnProperty.call(record.completedNodes, node.name)
@@ -527,6 +639,8 @@ export class FlowRunner {
         // Say what this run is doing while the step runs; each exit below clears it.
         const starting = await this.store.update(instanceId, { running: this.runningStep(node, state) });
         if (starting.status === "cancelled") return this.endCancelled(flow, state, instanceId, trace, starting.error);
+        const failedAtStart = this.failedOutside(instanceId, starting);
+        if (failedAtStart) return this.endFailedOutside(flow, state, instanceId, trace, failedAtStart);
         const result = await this.runWithRetry(node, state, flow, instanceId, signal);
 
         // ---- Paused for approval (do: wait, for: approval) ----------------------
@@ -543,6 +657,9 @@ export class FlowRunner {
             state,
             trace,
             running: undefined,
+            // A paused run has no process. Whoever resumes it becomes its owner.
+            owner: undefined,
+            claim: undefined,
             pausedAtIndex: i,
             resumeToken: result.approve.token,
             waitingFor: {
@@ -553,6 +670,8 @@ export class FlowRunner {
             },
           }, undefined, result.approve.approval);
           if (paused.status === "cancelled") return this.endCancelled(flow, state, instanceId, trace, paused.error);
+          const failedAtPause = this.failedOutside(instanceId, paused);
+          if (failedAtPause) return this.endFailedOutside(flow, state, instanceId, trace, failedAtPause);
           return {
             ok: true,
             status: "paused",
@@ -599,8 +718,9 @@ export class FlowRunner {
           durationMs: Date.now() - t0,
         };
         trace.push(entry);
-        const cancelled = await this.cancelledOnRecord(instanceId);
-        if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
+        const ended = await this.endedOnRecord(instanceId);
+        if (ended.cancelled) return this.endCancelled(flow, state, instanceId, trace, ended.cancelled);
+        if (ended.failed) return this.endFailedOutside(flow, state, instanceId, trace, ended.failed);
         if (node.onError === "continue") {
           // The failure becomes the step's result and the run goes on. It is
           // not memoized: a retry of the container around it runs it again.
@@ -623,10 +743,14 @@ export class FlowRunner {
       }
     }
 
-    const cancelled = await this.cancelledOnRecord(instanceId);
-    if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
+    const ended = await this.endedOnRecord(instanceId);
+    if (ended.cancelled) return this.endCancelled(flow, state, instanceId, trace, ended.cancelled);
+    if (ended.failed) return this.endFailedOutside(flow, state, instanceId, trace, ended.failed);
     const finished = await this.store.update(instanceId, { status: "completed", state, trace, error: undefined, running: undefined });
     if (finished.status === "cancelled") return this.endCancelled(flow, state, instanceId, trace, finished.error);
+    // A store that keeps an end written from outside answers with it.
+    const failedAtEnd = this.failedOutside(instanceId, finished);
+    if (failedAtEnd) return this.endFailedOutside(flow, state, instanceId, trace, failedAtEnd);
     return {
       ok: true,
       status: "completed",
@@ -2337,6 +2461,17 @@ export class FlowRunner {
       updatedAt: run.updatedAt,
       ...(run.error ? { error: run.error.slice(0, RUN_STATUS_ERROR_CHARS) } : {}),
     };
+  }
+
+  /**
+   * Fail the runs of this store that say "running" while nothing is executing
+   * them: the process that was running them was killed, or stopped, before it
+   * could record how they ended. Each gets status "failed" and an error saying
+   * so. The serving process calls this on a timer; any process may call it.
+   * See reconcileRuns() in ownership.ts for what counts as proof.
+   */
+  reconcile(opts?: ReconcileOptions): Promise<ReconcileResult> {
+    return reconcileRuns(this.store, opts);
   }
 
   /** List all pending approvals across all flow instances */

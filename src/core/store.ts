@@ -1,7 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
+import { randomUUID } from "crypto";
 import { listRuns, listSubRuns, sweepRuns, type ListRunsOptions, type ListSubRunsOptions } from "./runs.js";
-import type { FlowState, FlowResult, TraceEntry, PendingApproval, RunningStep } from "./types.js";
+import type { FlowState, FlowResult, TraceEntry, PendingApproval, RunningStep, RunOwner, OwnerBeat } from "./types.js";
 
 // ---- Durable State Store --------------------------------------------------------
 // Persists flow instance state to disk so flows survive gateway restarts.
@@ -24,6 +25,13 @@ export interface InstanceRecord {
   completedNodes: Record<string, unknown>; // nodeName -> output (memoized)
   trace: TraceEntry[]; // persisted trace survives resume
   running?: RunningStep; // the step executing now; cleared when it ends
+  /** The process executing this top-level run, set when it starts or resumes
+   *  (ownership.ts). It means something only while `status` is "running". */
+  owner?: RunOwner;
+  /** New each time a process takes the run: when it starts and at every
+   *  resume. Tells a run that was paused and taken again from the one a
+   *  reconcile pass looked at. */
+  claim?: string;
   pausedAtIndex?: number; // node index where flow paused (for resume)
   resumeToken?: string;
   waitingFor?: FlowResult["waitingFor"];
@@ -53,6 +61,9 @@ export interface RunIndexEntry {
   error?: string;
   resumeToken?: string;
   waitingFor?: InstanceRecord["waitingFor"];
+  /** While the run is running: the process executing it, and its claim. */
+  owner?: RunOwner;
+  claim?: string;
   traceCount: number;
   nodeCount: number;
 }
@@ -67,6 +78,7 @@ export function runIndexEntry(r: InstanceRecord): RunIndexEntry {
     ...(r.error ? { error: r.error } : {}),
     ...(r.resumeToken ? { resumeToken: r.resumeToken } : {}),
     ...(r.waitingFor ? { waitingFor: r.waitingFor } : {}),
+    ...(r.status === "running" && r.owner ? { owner: r.owner, ...(r.claim ? { claim: r.claim } : {}) } : {}),
     traceCount: Array.isArray(r.trace) ? r.trace.length : 0,
     nodeCount: r.completedNodes ? Object.keys(r.completedNodes).length : 0,
   };
@@ -129,11 +141,30 @@ export function readFreshRunIndex(stateDir: string, fileBase: string): RunIndexE
   }
 }
 
+/** stateDir/_owners/<owner id>.json: one file per engine process with runs
+ *  here, holding its RunOwner. Its mtime is the process's last heartbeat. */
+export const OWNERS_DIR = "_owners";
+
+/**
+ * A top-level run that failed is not written again. Its own execution writes
+ * "failed" as its last act, so a later write can only come from a process that
+ * a reconcile pass took for gone and that was in fact stalled (ownership.ts):
+ * its step finishing late must not turn a failed run back into a running,
+ * paused or completed one, nor change what the record says happened. A
+ * sub-flow instance is different: a retry of its parent runs it once more.
+ */
+export function isSettledFailure(record: Pick<InstanceRecord, "instanceId" | "status">): boolean {
+  return record.status === "failed" && !record.instanceId.includes(":");
+}
+
 export class StateStore {
   /** The state directory: one `<instanceId>.json` per run (see runs.ts for reads). */
   readonly dir: string;
-
-  get identity(): string { return `json:${path.resolve(this.dir)}`; }
+  /** A directory on this machine's disk. */
+  readonly local = true;
+  /** The directory's real path: two spellings of one directory (a symlink)
+   *  are one store, with one set of live runs. */
+  readonly identity: string;
 
   listRuns(opts?: ListRunsOptions) { return listRuns(this.dir, opts); }
   listSubRuns(parentId: string, opts?: ListSubRunsOptions) { return listSubRuns(this.dir, parentId, opts); }
@@ -143,7 +174,8 @@ export class StateStore {
   checkpoint(id: string, patch: Partial<InstanceRecord>, memo?: { node: string; output: unknown }, approval?: PendingApproval): InstanceRecord {
     if (memo) this.memoize(id, memo.node, memo.output);
     const record = this.update(id, patch);
-    if (approval) this.addApproval(approval);
+    // Neither write above touched a run that had failed; nor does this one.
+    if (approval && !isSettledFailure(record)) this.addApproval(approval);
     return record;
   }
 
@@ -155,12 +187,14 @@ export class StateStore {
         "flow-state",
       );
     fs.mkdirSync(this.dir, { recursive: true });
+    this.identity = `json:${fs.realpathSync(this.dir)}`;
   }
 
   create(
     instanceId: string,
     flowName: string,
     initialState: FlowState,
+    owner?: RunOwner,
   ): InstanceRecord {
     const record: InstanceRecord = {
       instanceId,
@@ -169,6 +203,7 @@ export class StateStore {
       state: initialState,
       completedNodes: {},
       trace: [],
+      ...(owner ? { owner, claim: randomUUID() } : {}),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -197,6 +232,7 @@ export class StateStore {
   ): InstanceRecord {
     const existing = this.get(instanceId);
     if (!existing) throw new Error(`Instance not found: ${instanceId}`);
+    if (isSettledFailure(existing)) return existing;
     const updated = {
       ...existing,
       ...patch,
@@ -206,9 +242,21 @@ export class StateStore {
     return updated;
   }
 
+  amend(
+    instanceId: string,
+    change: (record: InstanceRecord) => Partial<InstanceRecord> | null,
+  ): InstanceRecord | null {
+    const existing = this.get(instanceId);
+    const patch = existing ? change(existing) : null;
+    if (!existing || !patch) return null;
+    const updated = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+    this.write(updated);
+    return updated;
+  }
+
   memoize(instanceId: string, nodeName: string, output: unknown): void {
     const record = this.get(instanceId);
-    if (!record) return;
+    if (!record || isSettledFailure(record)) return;
     record.completedNodes[nodeName] = output;
     record.updatedAt = new Date().toISOString();
     this.write(record);
@@ -280,6 +328,61 @@ export class StateStore {
       return JSON.parse(fs.readFileSync(this.approvalsFile, "utf8")) as PendingApproval[];
     } catch {
       return [];
+    }
+  }
+
+  // ---- Engine processes (ownership.ts) -------------------------------------------
+
+  private ownerFile(id: string): string {
+    return path.join(this.dir, OWNERS_DIR, `${this.fileBase(id)}.json`);
+  }
+
+  beat(owner: RunOwner): void {
+    const file = this.ownerFile(owner.id);
+    const now = new Date();
+    try {
+      fs.utimesSync(file, now, now);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      // First beat, or a reconcile pass took this process for gone.
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(owner));
+      fs.renameSync(tmp, file);
+    }
+  }
+
+  owners(): OwnerBeat[] {
+    const dir = path.join(this.dir, OWNERS_DIR);
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+    const now = Date.now();
+    const beats: OwnerBeat[] = [];
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const file = path.join(dir, name);
+        const owner = JSON.parse(fs.readFileSync(file, "utf8")) as RunOwner;
+        if (typeof owner?.id !== "string" || typeof owner.pid !== "number") continue;
+        beats.push({ ...owner, ageMs: Math.max(0, now - fs.statSync(file).mtimeMs) });
+      } catch {
+        // Removed between the listing and the read: it is no longer an owner.
+      }
+    }
+    return beats;
+  }
+
+  forgetOwner(id: string, quietForMs?: number): void {
+    const file = this.ownerFile(id);
+    try {
+      if (quietForMs !== undefined && Date.now() - fs.statSync(file).mtimeMs <= quietForMs) return;
+      fs.unlinkSync(file);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   }
 

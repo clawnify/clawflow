@@ -120,8 +120,14 @@ export function listSubRuns(stateDir: string, parentId: string, opts: ListSubRun
   const filePrefix = prefix.replace(/[^a-zA-Z0-9_-]/g, "_");
   for (const file of fs.readdirSync(stateDir)) {
     if (!file.startsWith(filePrefix) || !file.endsWith(".json")) continue;
-    const r = JSON.parse(fs.readFileSync(path.join(stateDir, file), "utf8")) as InstanceRecord;
-    if (!r.instanceId?.startsWith(prefix)) continue;
+    let r: InstanceRecord;
+    try {
+      r = JSON.parse(fs.readFileSync(path.join(stateDir, file), "utf8")) as InstanceRecord;
+    } catch {
+      // Cut short by a kill mid-write, like the top-level reads skip it.
+      continue;
+    }
+    if (!r?.instanceId?.startsWith(prefix)) continue;
     if (opts.node && r.instanceId.slice(prefix.length).split(":")[1] !== opts.node) continue;
     if (opts.flow && r.flowName !== opts.flow) continue;
     if (opts.status && r.status !== opts.status) continue;

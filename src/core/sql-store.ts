@@ -1,16 +1,20 @@
 import * as path from "node:path";
-import { createHash } from "node:crypto";
-import { runIndexEntry, type InstanceRecord, type RunIndexEntry } from "./store.js";
-import type { FlowState, PendingApproval } from "./types.js";
+import { createHash, randomUUID } from "node:crypto";
+import { isSettledFailure, runIndexEntry, type InstanceRecord, type RunIndexEntry } from "./store.js";
+import type { FlowState, PendingApproval, RunOwner, OwnerBeat } from "./types.js";
 import type { ExecutionStore, StorageConfig } from "./storage.js";
 import { encodeCursor, parseRunPage, type ListRunsOptions, type ListSubRunsOptions, type RunPage, type SweepResult } from "./runs.js";
 import { PostgresDriver, SqliteDriver, canonicalStoragePath, type Query, type SqlDriver } from "./sql-driver.js";
 
 export class SqlStateStore implements ExecutionStore {
   readonly identity: string;
+  /** A SQLite file is on this machine's disk; a PostgreSQL namespace may be
+   *  shared by engines on other hosts. */
+  readonly local: boolean;
   private readonly driver: SqlDriver;
   private readonly namespace: string;
   constructor(readonly dir: string, config: Exclude<StorageConfig, { backend: "json" }>) {
+    this.local = config.backend === "sqlite";
     if (config.backend === "sqlite") {
       const file = canonicalStoragePath(config.path ?? path.join(dir, "clawflow.sqlite"));
       this.driver = new SqliteDriver(file);
@@ -42,9 +46,9 @@ export class SqlStateStore implements ExecutionStore {
     }
   }
 
-  create(instanceId: string, flowName: string, state: FlowState): Promise<InstanceRecord> {
+  create(instanceId: string, flowName: string, state: FlowState, owner?: RunOwner): Promise<InstanceRecord> {
     const now = new Date().toISOString();
-    const record: InstanceRecord = { instanceId, flowName, status: "running", state, completedNodes: {}, trace: [], createdAt: now, updatedAt: now };
+    const record: InstanceRecord = { instanceId, flowName, status: "running", state, completedNodes: {}, trace: [], ...(owner ? { owner, claim: randomUUID() } : {}), createdAt: now, updatedAt: now };
     return this.driver.transaction(async (q) => {
       // A parent retry revisits deterministic sub-flow IDs. Reuse their memos
       // so a successful child is not replayed after a sibling failed.
@@ -77,6 +81,8 @@ export class SqlStateStore implements ExecutionStore {
     return this.driver.transaction(async (q) => {
       const existing = await this.read(q, id, true);
       if (!existing) throw new Error(`Instance not found: ${id}`);
+      // A top-level run that failed is not written again (see isSettledFailure).
+      if (isSettledFailure(existing)) return existing;
       const updated = { ...existing, ...patch, instanceId: existing.instanceId, createdAt: existing.createdAt, updatedAt: new Date().toISOString() };
       // A concurrently finishing step must never resurrect a cancelled run.
       if (existing.status === "cancelled") {
@@ -87,6 +93,17 @@ export class SqlStateStore implements ExecutionStore {
       if (memo) updated.completedNodes = { ...updated.completedNodes, [memo.node]: memo.output };
       await this.write(q, updated);
       if (approval && updated.status !== "cancelled") await this.insertApproval(q, approval);
+      return updated;
+    });
+  }
+
+  amend(id: string, change: (record: InstanceRecord) => Partial<InstanceRecord> | null): Promise<InstanceRecord | null> {
+    return this.driver.transaction(async (q) => {
+      const existing = await this.read(q, id, true);
+      const patch = existing ? change(existing) : null;
+      if (!existing || !patch) return null;
+      const updated = { ...existing, ...patch, instanceId: existing.instanceId, createdAt: existing.createdAt, updatedAt: new Date().toISOString() };
+      await this.write(q, updated);
       return updated;
     });
   }
@@ -141,6 +158,28 @@ export class SqlStateStore implements ExecutionStore {
 
   listApprovals(): Promise<PendingApproval[]> {
     return this.driver.transaction(async (q) => (await q("SELECT record FROM clawflow_approvals WHERE namespace=$1 ORDER BY token", [this.namespace])).map((r) => JSON.parse(r.record as string)), false);
+  }
+
+  // ---- Engine processes (ownership.ts) -------------------------------------------
+  // The heartbeat and its age both come from the database's clock, so engines
+  // on different hosts need not agree on the time.
+
+  async beat(owner: RunOwner): Promise<void> {
+    await this.driver.transaction((q) => q(`INSERT INTO clawflow_owners (namespace,id,record,heartbeat_ms) VALUES ($1,$2,$3,${this.driver.nowMs})
+      ON CONFLICT (namespace,id) DO UPDATE SET heartbeat_ms=excluded.heartbeat_ms`, [this.namespace, owner.id, JSON.stringify(owner)]));
+  }
+
+  owners(): Promise<OwnerBeat[]> {
+    return this.driver.transaction(async (q) => {
+      const rows = await q(`SELECT record, ${this.driver.nowMs} - heartbeat_ms AS age_ms FROM clawflow_owners WHERE namespace=$1`, [this.namespace]);
+      return rows.map((r) => ({ ...JSON.parse(r.record as string), ageMs: Math.max(0, Number(r.age_ms)) }));
+    }, false);
+  }
+
+  async forgetOwner(id: string, quietForMs?: number): Promise<void> {
+    await this.driver.transaction((q) => quietForMs === undefined
+      ? q("DELETE FROM clawflow_owners WHERE namespace=$1 AND id=$2", [this.namespace, id])
+      : q(`DELETE FROM clawflow_owners WHERE namespace=$1 AND id=$2 AND ${this.driver.nowMs} - heartbeat_ms > $3`, [this.namespace, id, quietForMs]));
   }
 
   listRuns(opts: ListRunsOptions = {}): Promise<RunPage> {

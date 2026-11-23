@@ -51,6 +51,23 @@ export async function controlRequest(
       json(res, 200, { ok: true, ...page });
       return true;
     }
+    // POST /runs/reconcile { unowned? }: fail the runs that say "running" while
+    // nothing is executing them, now, instead of at the serving process's next
+    // pass. `unowned` also fails running runs that name no process at all.
+    if (id === "reconcile" && parts.length === 1 && req.method === "POST") {
+      let body: { unowned?: unknown } = {};
+      const raw = await readBody(req);
+      if (raw) {
+        try { body = JSON.parse(raw) ?? {}; }
+        catch { json(res, 400, { error: "Invalid JSON body" }); return true; }
+      }
+      if (body.unowned !== undefined && typeof body.unowned !== "boolean") {
+        json(res, 400, { error: "unowned must be boolean" }); return true;
+      }
+      const result = await runner.reconcile({ unowned: body.unowned === true, full: true });
+      json(res, 200, { ok: true, ...result });
+      return true;
+    }
     if (id && parts.length === 1 && req.method === "GET") {
       const run = await store.get(id);
       if (!run || run.instanceId !== id) { json(res, 404, { error: "Run not found", code: "run_not_found" }); return true; }

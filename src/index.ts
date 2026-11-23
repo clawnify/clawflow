@@ -7,6 +7,7 @@ export { default } from "./plugin/index.js";
 
 export { FlowRunner, sendEvent, targetsCallerSession, agentStepSessionKey } from "./core/runner.js";
 export type { CallerSession, CancelResult, RunStatus } from "./core/runner.js";
+export type { ReconcileOptions, ReconcileResult, ReconciledRun } from "./core/ownership.js";
 export { StateStore } from "./core/store.js";
 export type { InstanceRecord, RunIndexEntry } from "./core/store.js";
 export { importJsonState } from "./core/migrate-storage.js";
@@ -40,6 +41,8 @@ export type {
   InputSpec,
   TraceEntry,
   RunningStep,
+  RunOwner,
+  OwnerBeat,
   NodeStatus,
   RetryPolicy,
   PluginConfig,

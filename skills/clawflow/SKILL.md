@@ -649,6 +649,9 @@ One flow can start another, one run per work item, and check on it later:
   `completed`, `failed`, `cancelled`), `finished` (true for the last three) and,
   for a failed run, `error`. On the next pass, free every item whose run is
   `finished` instead of waiting out a time limit.
+- A run whose process was killed (a restart, a crash) ends as `failed` with an
+  `error` that starts with `Interrupted:`, within a couple of minutes. It is
+  not started again: start a new run for the item if the work still matters.
 - A flow that says `"overlap": "skip"` answers `/run` with
   `{ "code": "flow_running", "runningInstanceId": "..." }` and no `instanceId`
   while a run of it is going. Check `started.ok` before storing an id.

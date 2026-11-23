@@ -445,6 +445,24 @@ export interface RunningStep {
   target?: { agent?: string; sessionKey?: string; sessionId?: string };
 }
 
+/** The engine process executing a run: stamped on the run's record when it
+ *  starts or resumes, so a run whose process is gone can be told from one that
+ *  is only slow (see ownership.ts). */
+export interface RunOwner {
+  /** Unique to one process lifetime: a pid can be reused, this cannot. */
+  id: string;
+  pid: number;
+  host: string;
+  /** When that process started. */
+  startedAt: string;
+}
+
+/** An engine process as its store last heard from it. */
+export interface OwnerBeat extends RunOwner {
+  /** How long ago it last said it was alive, by the store's own clock. */
+  ageMs: number;
+}
+
 export type FlowStatus =
   | "running"
   | "completed"

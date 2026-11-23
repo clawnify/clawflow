@@ -79,6 +79,69 @@ function armRetention(
   retentionTimers = [first, daily];
 }
 
+// Reconcile: every RECONCILE_MS the serving process fails the runs that say
+// "running" while nothing is executing them (FlowRunner.reconcile). Armed and
+// retired like the sweep above. A pass that finds no process gone reads only
+// the store's short list of engine processes; every FULL_PASS_EVERY-th pass
+// reads the running runs whatever that list says, so a run the short way
+// cannot see (its process's entry was lost) is still found within ten minutes.
+const RECONCILE_MS = 30_000;
+const FULL_PASS_EVERY = 20;
+/** A pass still going after this long is taken for hung, and no longer holds
+ *  back the next one. */
+const PASS_STUCK_MS = 5 * 60_000;
+let reconcileTimers: Array<ReturnType<typeof setTimeout>> = [];
+let reconcilingSince = 0;
+
+type ReconcileLogger = { info: (msg: string) => void; warn: (msg: string) => void };
+
+/** One reconcile pass, with what it did written to the log. */
+export async function reconcilePass(runner: FlowRunner, logger?: ReconcileLogger, opts?: { full?: boolean }): Promise<void> {
+  if (reconcilingSince && Date.now() - reconcilingSince < PASS_STUCK_MS) return;
+  const started = (reconcilingSince = Date.now());
+  try {
+    const { failed, unowned, errors } = await runner.reconcile(opts);
+    for (const run of failed) {
+      logger?.warn(`clawflow: run ${run.instanceId} (${run.flowName}) marked failed: ${run.error}`);
+    }
+    for (const run of errors) {
+      logger?.warn(`clawflow: reconcile could not settle run ${run.instanceId}: ${run.error}`);
+    }
+    if (unowned) {
+      logger?.info(
+        `clawflow: ${unowned} run(s) say "running" with no process on record (started before 1.11.0); ` +
+          `they are left as they are. Cancel them, or POST /runs/reconcile {"unowned": true}`,
+      );
+    }
+  } catch (err) {
+    logger?.warn(`clawflow: reconcile failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    if (reconcilingSince === started) reconcilingSince = 0;
+  }
+}
+
+function armReconcile(runner: FlowRunner, logger?: ReconcileLogger): void {
+  for (const t of reconcileTimers) clearTimeout(t);
+  let last = Date.now();
+  let passes = 0;
+  const tick = () => {
+    // A tick that comes far too late means this process was not running (a
+    // suspended machine, a stalled host): so were the others, and their
+    // heartbeats look old for no reason. Give them one interval to renew.
+    const late = Date.now() - last > 2 * RECONCILE_MS;
+    last = Date.now();
+    if (late) return;
+    void reconcilePass(runner, logger, { full: ++passes % FULL_PASS_EVERY === 0 });
+  };
+  // Soon after start, off the startup path: that is when a restarted engine
+  // finds the runs its predecessor left behind.
+  const first = setTimeout(() => void reconcilePass(runner, logger), 3_000);
+  const every = setInterval(tick, RECONCILE_MS);
+  first.unref?.();
+  every.unref?.();
+  reconcileTimers = [first, every];
+}
+
 /**
  * Whether this process should own the box's scheduler and flow server.
  *
@@ -217,6 +280,7 @@ function register(api: PluginApi) {
     activeTriggerStore = triggerStore;
     scheduler.start();
     armRetention(store, pluginCfg.runRetentionDays ?? DEFAULT_RUN_RETENTION_DAYS, api.logger);
+    armReconcile(runner, api.logger);
   }
 
   // ---- Flow server (optional) ---------------------------------------------------
@@ -912,7 +976,7 @@ You must pass the original flow definition back so the runner can continue.`,
     {
       name: "flow_cancel",
       description: `Cancel a flow run that has not finished.
-A running flow stops where it is: the step it is on is aborted (an agent step's turn is aborted too) and the run ends with status "cancelled". A run paused at an approval gate, or left "running" by a gateway restart, is marked cancelled.
+A running flow stops where it is: the step it is on is aborted (an agent step's turn is aborted too) and the run ends with status "cancelled". A run paused at an approval gate, or one whose process is gone, is marked cancelled.
 Use the instanceId from flow_run or flow_status. A finished run (completed, failed, cancelled) is left as it is.`,
 
       parameters: {
