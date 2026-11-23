@@ -85,6 +85,16 @@ export function assertValidSchedule(cron: string, tz?: string): void {
 
 const DEFAULT_RESYNC_MS = 30_000;
 
+// ---- Runs in flight -------------------------------------------------------------
+// Which trigger is running which instance, for every scheduler in this process.
+// Held on `globalThis` like the live runs (active-runs.ts): a host may register
+// the plugin again while a run is going, which builds a new scheduler, and that
+// scheduler must still see the run the previous one started.
+const IN_FLIGHT_KEY = Symbol.for("@clawnify/clawflow/trigger-runs");
+type InFlightHolder = { [IN_FLIGHT_KEY]?: Map<string, string> };
+const inFlightHolder = globalThis as unknown as InFlightHolder;
+const inFlight: Map<string, string> = inFlightHolder[IN_FLIGHT_KEY] ?? (inFlightHolder[IN_FLIGHT_KEY] = new Map());
+
 export class TriggerScheduler {
   private jobs = new Map<string, Cron>();
   private armedSpecs = new Map<string, string>();
@@ -168,11 +178,20 @@ export class TriggerScheduler {
     return this.jobs.get(id)?.nextRun() ?? null;
   }
 
-  /** Fire a trigger immediately, ignoring its schedule (but not its existence). */
+  /**
+   * Fire a trigger immediately, ignoring its schedule (but not its existence).
+   * Like a tick, it does not start while the trigger's previous run is still
+   * going: it resolves to null and the record says why (lastError).
+   */
   async runNow(id: string): Promise<FlowResult | null> {
     const record = this.opts.store.get(id);
     if (!record) throw new Error(`Trigger not found: ${id}`);
     return this.fire(record, { manual: true });
+  }
+
+  /** The instance a trigger is running now, if its last fire has not ended. */
+  runInFlight(id: string): string | undefined {
+    return inFlight.get(this.flightKey(id));
   }
 
   // ---- Internals ---------------------------------------------------------------
@@ -184,10 +203,9 @@ export class TriggerScheduler {
         record.cron,
         {
           timezone: record.tz,
-          // Never start a run while the previous one is still going. croner
-          // only knows a run is going while the callback's promise is pending,
-          // so the callback must return it.
-          protect: true,
+          // Overlap is fire()'s job, not croner's `protect`: fire() also sees a
+          // run started by run-now or by a scheduler this one replaced, and it
+          // records the skipped tick, which `protect` drops silently.
           // Don't hold the process open on our account.
           unref: true,
           catch: true,
@@ -255,17 +273,28 @@ export class TriggerScheduler {
       return null;
     }
 
+    // One run per trigger at a time, whether a tick or run-now started it.
+    const key = this.flightKey(record.id);
+    const going = inFlight.get(key);
+    if (going) return this.skip(record.id, `Skipped: the previous run (${going}) is still going`);
+
     const instanceId = randomUUID();
     this.log.info(
       `[clawflow] trigger ${record.id} → ${record.flowName} ${loaded.source} (${instanceId})`,
     );
 
+    inFlight.set(key, instanceId);
     try {
       const result = await this.opts.runner.run(
         loaded.def,
         record.inputs ?? {},
         instanceId,
       );
+      // The flow allows one run at a time and another run of it was going
+      // (`overlap: "skip"`): nothing ran, so there is no instance to point at.
+      if (result.status === "skipped") {
+        return this.skip(record.id, result.error ?? "Skipped: another run of the flow is still going");
+      }
       this.opts.store.update(record.id, {
         lastRunAt: new Date().toISOString(),
         lastStatus: result.ok ? "ok" : "error",
@@ -290,7 +319,26 @@ export class TriggerScheduler {
         ...(this.nextRunIso(record.id) ?? {}),
       });
       return null;
+    } finally {
+      if (inFlight.get(key) === instanceId) inFlight.delete(key);
     }
+  }
+
+  /** Record a fire that did not start a run, so a skipped tick is visible. */
+  private skip(id: string, reason: string): null {
+    this.log.info(`[clawflow] trigger ${id} ${reason.charAt(0).toLowerCase()}${reason.slice(1)}`);
+    this.opts.store.update(id, {
+      lastRunAt: new Date().toISOString(),
+      lastStatus: "skipped",
+      lastError: reason,
+      ...(this.nextRunIso(id) ?? {}),
+    });
+    return null;
+  }
+
+  /** Trigger ids are unique per workspace, and a process can serve several. */
+  private flightKey(id: string): string {
+    return `${this.opts.workspace}\0${id}`;
   }
 
   private nextRunIso(id: string): { nextRunAt: string } | null {

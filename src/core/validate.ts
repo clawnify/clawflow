@@ -57,6 +57,10 @@ export function validateFlow(
     return { ok: false, errors, warnings };
   }
 
+  if (flow.overlap !== undefined && flow.overlap !== "allow" && flow.overlap !== "skip") {
+    errors.push({ field: "overlap", message: '"overlap" must be "allow" or "skip"' });
+  }
+
   // Validate env field if present
   if (flow.env !== undefined) {
     if (typeof flow.env !== "object" || flow.env === null || Array.isArray(flow.env)) {
@@ -206,6 +210,7 @@ const BASE_NODE_KEYS: ReadonlySet<string> = new Set([
   "output",
   "retry",
   "timeout",
+  "onError",
 ]);
 
 /** Validate required fields per node type */
@@ -234,6 +239,10 @@ function validateNodeFields(
         e(key, `Unknown field "${key}" on ${nodeType} node "${node.name}"`);
       }
     }
+  }
+
+  if (node.onError !== undefined && node.onError !== "fail" && node.onError !== "continue") {
+    e("onError", `"onError" on node "${node.name}" must be "fail" or "continue"`);
   }
 
   switch (nodeType) {

@@ -135,6 +135,17 @@ ${nodeCode}
 // ---- Per-node transpilation -----------------------------------------------------
 
 function transpileNode(node: FlowNode, indent: number): string {
+  if (node.onError !== "continue") return transpileStep(node, indent);
+  // onError: "continue". Later steps read `state`, never the step's own
+  // const, so the step can sit inside the try block.
+  const pad = " ".repeat(indent);
+  const failed = node.output
+    ? `\n${pad}  state["${node.output}"] = { error: err instanceof Error ? err.message : String(err) };\n${pad}`
+    : " ";
+  return `${pad}try {\n${transpileStep(node, indent + 2)}\n${pad}} catch (err) {${failed}}`;
+}
+
+function transpileStep(node: FlowNode, indent: number): string {
   const pad = " ".repeat(indent);
   const retryConfig = node.retry
     ? `, { retries: { limit: ${node.retry.limit}, delay: "${node.retry.delay}"${node.retry.backoff ? `, backoff: "${node.retry.backoff}"` : ""} }${node.timeout ? `, timeout: "${node.timeout}"` : ""} }`

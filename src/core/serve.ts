@@ -15,6 +15,7 @@ import { resolveRunnableFlow } from "./manage.js";
 //
 // Endpoints:
 //   POST /:basePath/:flowName/run  — run a flow with the JSON body as inputs
+//   GET  /:basePath/runs/:id/status: whether a run is over, and how it ended
 //   POST /:basePath/runs/:id/cancel: cancel a run that has not finished
 //   POST /:basePath/validate       — statically validate a flow definition
 //   GET  /:basePath/health         — health check
@@ -155,7 +156,8 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
     //   POST   /:basePath/triggers              create { flow, cron, tz?, inputs?, description?, enabled?, version? }
     //   PATCH  /:basePath/triggers/:id          update any of those, enabled:false pauses
     //   DELETE /:basePath/triggers/:id
-    //   POST   /:basePath/triggers/:id/run      fire now (202; the run is async)
+    //   POST   /:basePath/triggers/:id/run      fire now (202; the run is async).
+    //                                           409 trigger_running while its previous run is going
     const triggersBase = `${basePath}/triggers`;
     if (pathname === triggersBase || pathname.startsWith(`${triggersBase}/`)) {
       const wired = opts.triggers?.() ?? null;
@@ -305,6 +307,15 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
             json(res, 404, { error: `Trigger not found: ${id}` });
             return;
           }
+          const going = scheduler.runInFlight(id);
+          if (going) {
+            json(res, 409, {
+              error: `Trigger ${id} is still running (run ${going})`,
+              code: "trigger_running",
+              runningInstanceId: going,
+            });
+            return;
+          }
           // Same contract as /:flowName/run: acknowledge, then run detached.
           // The outcome lands on the record (lastInstanceId / lastStatus).
           json(res, 202, { ok: true, id });
@@ -322,6 +333,27 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
         // Everything that throws here is a client-side problem: a schedule the
         // validator rejects, a duplicate id, a record that vanished mid-request.
         json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // Run status: GET /:basePath/runs/:instanceId/status
+    // What a caller that started a run needs to know about it later: is it
+    // over, and how did it end. Open like /run and /cancel, to whoever holds
+    // the run id, so a flow's http step can ask; the answer has no state, no
+    // outputs and no approval token (those are the authenticated reads in
+    // control.ts).
+    const statusMatch = pathname.match(new RegExp(
+      `^${basePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/runs/([a-zA-Z0-9_-]+)/status$`,
+    ));
+    if (statusMatch && req.method === "GET") {
+      try {
+        const status = await runner.runStatus(statusMatch[1]);
+        if (status) json(res, 200, { ok: true, ...status });
+        else json(res, 404, { error: `Run not found: ${statusMatch[1]}`, code: "run_not_found" });
+      } catch (err) {
+        log.error(`[clawflow] status error: ${err instanceof Error ? err.message : String(err)}`);
+        json(res, 500, { error: "Internal server error" });
       }
       return;
     }
@@ -393,6 +425,22 @@ export function startFlowServer(opts: FlowServerOpts): http.Server {
           json(res, 400, { error: "Invalid JSON body" });
           return;
         }
+      }
+
+      // A flow that allows one run at a time (`overlap: "skip"`) refuses the
+      // start while a run of it is going. `runningInstanceId`, never
+      // `instanceId`: an http step does not fail on a status code, and a
+      // caller that stores `instanceId` must not end up holding another run's.
+      // Nothing awaits between this check and run() below registering the run.
+      const running = runner.overlapping(flowDef);
+      if (running) {
+        json(res, 409, {
+          error: `Flow "${flowName}" is already running (run ${running})`,
+          code: "flow_running",
+          flow: flowName,
+          runningInstanceId: running,
+        });
+        return;
       }
 
       // Fire-and-forget: start the flow, return immediately with instanceId

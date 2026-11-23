@@ -525,7 +525,7 @@ flow_trigger action: "create" flow: "digest" cron: "0 9 * * *" inputs: '{"custom
 | Timezone | IANA name (`Europe/Rome`); host local time when omitted |
 | Version | Latest published by default; pin with `version: 2` |
 | Missed runs | **Not replayed** — a host that was down at 09:00 waits for the next occurrence |
-| Overlap | A tick is skipped if the previous run is still going |
+| Overlap | A tick or a run-now is skipped while that trigger's previous run is still going, and the trigger records it (`lastStatus: "skipped"`) |
 | Flow deleted | Triggers are **paused**, not removed, so a restore keeps them |
 | Approval | Arming/pausing/deleting a schedule is gated like flow authoring |
 
@@ -534,6 +534,42 @@ Out-of-process callers — the Clawnify hook server and dashboard — read and w
 them by importing `TriggerStore` from `dist`, the same way they read published
 versions. The running scheduler re-reads the directory every 30s, so a schedule
 created or edited in the dashboard goes live without a restart.
+
+### One run at a time
+
+Two rules decide whether a run may start while another is going. "Going" means
+executing: a run paused at an approval holds nothing back, and it resumes when
+approved even if another run has started since.
+
+**A trigger never overlaps itself.** A tick, `flow_trigger action: "run_now"`
+and `POST /flows/triggers/:id/run` all refuse to start while that trigger's
+previous run is going. The trigger's record says so (`lastStatus: "skipped"`,
+and `lastError` names the run in flight), and the route answers 409
+`trigger_running` with `runningInstanceId`. Two triggers on one flow are
+independent, and so is a run started any other way.
+
+**A flow can allow one run at a time, whoever starts it.** Put `"overlap": "skip"`
+on the flow:
+
+```json
+{ "flow": "dispatch-orders", "overlap": "skip", "nodes": [ ... ] }
+```
+
+Then a run of it is not started while another run of it is executing, from any
+entry point. A trigger records the skip. `POST /flows/:name/run` answers 409:
+
+```json
+{ "error": "Flow \"dispatch-orders\" is already running (run 3f2a...)", "code": "flow_running", "flow": "dispatch-orders", "runningInstanceId": "3f2a..." }
+```
+
+`flow_run` returns `status: "skipped"` with the same `runningInstanceId`. A
+refused start writes no run record, and a webhook that asked for it is not
+queued. Use it for a flow that reads state, works, then writes it back. Leave
+it off (the default, `"allow"`) for a flow that is started once per work item
+and is meant to run many at once.
+
+The rule holds inside one engine process, which is where the scheduler, the
+flow server and `flow_run` all run.
 
 ---
 
@@ -558,6 +594,71 @@ Any node can define per-node retry behavior. Learned directly from Cloudflare's 
 | `backoff` | `constant`, `linear`, `exponential` | `constant` |
 
 Strongly recommended on `do: http` and `do: ai` nodes. Do not use on `do: wait` — retrying approval gates makes no sense.
+
+---
+
+## Errors
+
+A step that fails after its retries ends the run as `failed`, and nothing after
+it runs. `"onError": "continue"` on a step changes that for this step:
+
+```json
+{ "name": "work", "do": "agent", "task": "Process order {{ inputs.order }}", "timeout": "1h", "onError": "continue", "output": "work" },
+{ "name": "failed", "do": "condition", "if": "work.error", "then": [
+  { "name": "record", "do": "memory", "action": "write", "key": "order-{{ inputs.order }}", "value": "failed: {{ work.error }}" }
+] }
+```
+
+The step is recorded in the trace as `error`, its `output` key holds
+`{ "error": "<message>" }`, and the next step runs. A step that succeeded has
+no `error` there, so `"if": "work.error"` tells the two apart. It covers a step
+that runs out of time, and any step type, containers included: on a step
+inside a loop it lets the loop go on to the next item. A cancel still cancels
+the run, and `"onError": "fail"` is the default.
+
+An `http` step does not fail on a status code: it returns the body it got. Only
+a request that could not be made or answered counts as a failure.
+
+---
+
+## Starting a Run from a Flow
+
+A flow starts another flow with an `http` step on the flow server, and reads
+how that run is doing with a second one:
+
+```json
+{ "name": "start", "do": "http", "method": "POST", "url": "http://127.0.0.1:18793/flows/process-order/run", "body": { "order": "{{ item.id }}" }, "output": "started" },
+{ "name": "check", "do": "http", "url": "http://127.0.0.1:18793/flows/runs/{{ started.instanceId }}/status", "output": "run" }
+```
+
+`POST /flows/:name/run` answers 202 with `{ "ok": true, "instanceId": "..." }`
+and the run goes on by itself. `GET /flows/runs/:instanceId/status` answers:
+
+```json
+{ "ok": true, "instanceId": "3f2a...", "flow": "process-order", "status": "failed", "finished": true, "error": "Node \"work\": ...", "createdAt": "...", "updatedAt": "..." }
+```
+
+`status` is `running`, `paused`, `waiting`, `completed`, `failed` or
+`cancelled`. `finished` is true for the last three: the run will not change
+again. `error` is there for a failed or cancelled run, cut at 2000 characters.
+An unknown run answers 404 with `"code": "run_not_found"`.
+
+So a flow that hands work to other runs keeps each run's `instanceId` with the
+work item, and on its next pass frees the items whose run is `finished`,
+instead of waiting out that run's whole time limit.
+
+Like `/run` and `/cancel`, the status route needs only the run id, and it is
+read from the run's summary: no state, no outputs, no approval token. The
+routes that return those need the host's token (see "Reading and closing a
+configured store").
+
+A run whose process was killed before it could record its end keeps saying
+`running`. `flow_cancel` or `POST /flows/runs/:instanceId/cancel` settles it.
+
+Flow memory has no atomic update. A `memory` read followed by a write can
+overwrite what another run wrote in between, so give each work item its own
+key (`order-{{ item.id }}`) and keep shared lists out of memory that several
+runs write.
 
 ---
 

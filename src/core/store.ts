@@ -182,6 +182,15 @@ export class StateStore {
     return JSON.parse(fs.readFileSync(file, "utf8")) as InstanceRecord;
   }
 
+  summary(instanceId: string): RunIndexEntry | null {
+    // The index entry when it still describes the record on disk, else the
+    // record itself (a sub-flow, or a record written before the index existed).
+    const indexed = readFreshRunIndex(this.dir, this.fileBase(instanceId));
+    if (indexed) return indexed.instanceId === instanceId ? indexed : null;
+    const record = this.get(instanceId);
+    return record && record.instanceId === instanceId ? runIndexEntry(record) : null;
+  }
+
   update(
     instanceId: string,
     patch: Partial<InstanceRecord>,

@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { createHash } from "node:crypto";
-import { runIndexEntry, type InstanceRecord } from "./store.js";
+import { runIndexEntry, type InstanceRecord, type RunIndexEntry } from "./store.js";
 import type { FlowState, PendingApproval } from "./types.js";
 import type { ExecutionStore, StorageConfig } from "./storage.js";
 import { encodeCursor, parseRunPage, type ListRunsOptions, type ListSubRunsOptions, type RunPage, type SweepResult } from "./runs.js";
@@ -59,6 +59,13 @@ export class SqlStateStore implements ExecutionStore {
 
   get(id: string): Promise<InstanceRecord | null> {
     return this.driver.transaction((q) => this.read(q, id), false);
+  }
+
+  summary(id: string): Promise<RunIndexEntry | null> {
+    return this.driver.transaction(async (q) => {
+      const rows = await q("SELECT summary FROM clawflow_runs WHERE namespace=$1 AND id=$2", [this.namespace, id]);
+      return rows[0] ? JSON.parse(rows[0].summary as string) : null;
+    }, false);
   }
 
   update(id: string, patch: Partial<InstanceRecord>): Promise<InstanceRecord> {

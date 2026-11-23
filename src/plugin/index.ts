@@ -381,6 +381,12 @@ All nodes require "name" and "do". Templates: {{ outputKey.field }}.`,
             type: "string",
             description: 'Semver version string, e.g. "1.0.0"',
           },
+          overlap: {
+            type: "string",
+            enum: ["allow", "skip"],
+            description:
+              '"skip": at most one run of this flow executes at a time; a start while another run is going is refused, whoever asks. Use it for a flow that reads state, works, then writes it back. Default "allow".',
+          },
         },
       },
 
@@ -394,6 +400,7 @@ All nodes require "name" and "do". Templates: {{ outputKey.field }}.`,
           inputs?: FlowDefinition["inputs"];
           env?: Record<string, string | null>;
           version?: string;
+          overlap?: FlowDefinition["overlap"];
         },
       ) {
         const fs = await import("fs");
@@ -429,6 +436,7 @@ All nodes require "name" and "do". Templates: {{ outputKey.field }}.`,
           ...(params.description && { description: params.description }),
           ...(params.inputs && { inputs: params.inputs }),
           ...(params.env && { env: params.env }),
+          ...(params.overlap && { overlap: params.overlap }),
           nodes: params.nodes,
         };
 
@@ -681,7 +689,8 @@ Node types:
   sleep    — pause for duration: { duration: "5m" }
   code     — inline JS expression: { run: "...", input? }
 
-All nodes support retry: { limit, delay, backoff } and timeout.
+All nodes support retry: { limit, delay, backoff }, timeout, and onError: "continue"
+(after its retries a failed step is recorded, its output is { error }, and the next step runs).
 Templates: use {{ nodeName.field }} to reference any value in flow state.
 Returns instanceId for status tracking and resume.
 
@@ -1510,7 +1519,7 @@ modify the draft without affecting published versions.`,
       description: `Edit nodes in a clawflow definition. Operates on a file or inline flow.
 
 Actions:
-  set     — set top-level flow fields (description, inputs, env, version)
+  set     — set top-level flow fields (description, inputs, env, version, overlap)
   update  — update a node entirely or patch specific fields by node name
   add     — insert a new node at a position (default: end)
   remove  — remove a node by name
@@ -1582,7 +1591,7 @@ re-send the whole flow: a single large edit is slow and can stall mid-generation
           fields: {
             type: "object",
             additionalProperties: true,
-            description: "For action=set: top-level flow fields to set (description, inputs, env, version). For action=update: partial field updates to merge into the node.",
+            description: "For action=set: top-level flow fields to set (description, inputs, env, version, overlap). For action=update: partial field updates to merge into the node.",
           },
           replace: {
             type: "object",
@@ -1850,7 +1859,7 @@ re-send the whole flow: a single large edit is slow and can stall mid-generation
           if (!params.fields)
             return fail('action "set" requires "fields".');
 
-          const allowed = ["description", "inputs", "env", "version"];
+          const allowed = ["description", "inputs", "env", "version", "overlap"];
           const backup = { ...flowDef };
 
           for (const [key, value] of Object.entries(params.fields)) {

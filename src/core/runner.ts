@@ -209,6 +209,39 @@ export class FlowRunner {
     const id = instanceId ?? crypto.randomUUID();
     const state: FlowState = { inputs: input };
 
+    // `overlap: "skip"`: refuse the start while another run of this flow is
+    // executing. The check and the registration below happen before the first
+    // await, so two starts in the same instant cannot both pass.
+    const running = this.overlapping(flow);
+    if (running) {
+      return {
+        ok: false,
+        status: "skipped",
+        flowName: flow.flow,
+        instanceId: id,
+        state,
+        trace: [],
+        error: `Flow "${flow.flow}" is already running (run ${running}); it allows one run at a time ("overlap": "skip")`,
+        runningInstanceId: running,
+      };
+    }
+    const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
+    liveRuns.set(this.runKey(id), live);
+    try {
+      return await this.startRun(flow, input, id, state, live);
+    } finally {
+      if (liveRuns.get(this.runKey(id)) === live) liveRuns.delete(this.runKey(id));
+    }
+  }
+
+  /** Check inputs, resolve env and execute a run whose live entry is held. */
+  private async startRun(
+    flow: FlowDefinition,
+    input: unknown,
+    id: string,
+    state: FlowState,
+    live: LiveRun,
+  ): Promise<FlowResult> {
     // Validate declared inputs against the actual payload before any node runs.
     if (flow.inputs && typeof flow.inputs === "object") {
       const payload = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
@@ -288,7 +321,22 @@ export class FlowRunner {
       if (Object.keys(env).length > 0) state.env = env;
     }
 
-    return this.executeRun(flow, state, id, 0, []);
+    return this.executeRun(flow, state, id, 0, [], live);
+  }
+
+  /**
+   * The run that holds back a new run of `flow`: set only when the flow says
+   * `overlap: "skip"` and a run of it is executing in this process against the
+   * same store. Returns that run's instanceId.
+   */
+  overlapping(flow: FlowDefinition): string | undefined {
+    if (flow.overlap !== "skip") return undefined;
+    const prefix = `${this.store.identity}\0`;
+    for (const [key, run] of liveRuns) {
+      // Sub-flows are never registered, so every entry is a top-level run.
+      if (run.flowName === flow.flow && key.startsWith(prefix)) return key.slice(prefix.length);
+    }
+    return undefined;
   }
 
   // ---- Resume after approval ----------------------------------------------------
@@ -394,8 +442,11 @@ export class FlowRunner {
     instanceId: string,
     startIndex: number,
     priorTrace: TraceEntry[],
+    held?: LiveRun,
   ): Promise<FlowResult> {
-    const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
+    // A new run registered itself before its first await (runFlow); a resumed
+    // run registers here.
+    const live: LiveRun = held ?? { controller: new AbortController(), flowName: flow.flow };
     liveRuns.set(this.runKey(instanceId), live);
     try {
       const done = this.execute(flow, state, instanceId, startIndex, priorTrace, live.controller.signal);
@@ -550,6 +601,14 @@ export class FlowRunner {
         trace.push(entry);
         const cancelled = await this.cancelledOnRecord(instanceId);
         if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
+        if (node.onError === "continue") {
+          // The failure becomes the step's result and the run goes on. It is
+          // not memoized: a retry of the container around it runs it again.
+          if (node.output) state[node.output] = { error: message };
+          await this.store.update(instanceId, { state, trace, running: undefined });
+          i++;
+          continue;
+        }
         const error = `Node "${node.name}": ${message}`;
         await this.store.update(instanceId, { status: "failed", state, trace, error, running: undefined });
         return {
@@ -2260,6 +2319,26 @@ export class FlowRunner {
     return this.store;
   }
 
+  /**
+   * Whether a top-level run is over, and how it ended. Read from the run's
+   * summary, never its record, so polling it costs the same however much the
+   * run has produced. Carries nothing a holder of the run id could not already
+   * act on: no state, no outputs, no approval token.
+   */
+  async runStatus(instanceId: string): Promise<RunStatus | null> {
+    const run = await this.store.summary(instanceId);
+    if (!run) return null;
+    return {
+      instanceId: run.instanceId,
+      flow: run.flowName,
+      status: run.status,
+      finished: FINISHED_STATUSES.has(run.status),
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+      ...(run.error ? { error: run.error.slice(0, RUN_STATUS_ERROR_CHARS) } : {}),
+    };
+  }
+
   /** List all pending approvals across all flow instances */
   listApprovals() {
     return this.store.listApprovals();
@@ -2314,3 +2393,18 @@ export type CancelResult =
   | { ok: false; instanceId: string; error: "finished"; status: FlowStatus };
 
 const FINISHED_STATUSES = new Set<string>(["completed", "failed", "cancelled"]);
+
+/** What runStatus() answers. `finished` is true once the run can no longer
+ *  change: completed, failed or cancelled. */
+export interface RunStatus {
+  instanceId: string;
+  flow: string;
+  status: Exclude<FlowStatus, "skipped">;
+  finished: boolean;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
+/** An error can quote a whole response body; a status read stays small. */
+const RUN_STATUS_ERROR_CHARS = 2_000;

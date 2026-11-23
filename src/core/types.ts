@@ -23,6 +23,14 @@ export interface FlowDefinition {
   inputs?: Record<string, InputSpec>;
   /** Environment variables the flow expects. Values are defaults; null means required (runtime must provide). */
   env?: Record<string, string | null>;
+  /**
+   * What happens when a run of this flow would start while another run of it
+   * is still executing. "allow" (default): both run. "skip": the new run is
+   * not started, whoever asked for it (a schedule, the flow server, flow_run).
+   * A run paused at an approval is not executing, so it does not hold others
+   * back, and it resumes when approved even if another run has started since.
+   */
+  overlap?: "allow" | "skip";
   nodes: FlowNode[];
 }
 
@@ -64,6 +72,13 @@ export interface BaseNode {
   output?: string; // store result under this key in flow state
   retry?: RetryPolicy; // per-node retry policy
   timeout?: string | number; // e.g. "30s", or ms integer
+  /**
+   * What a failure of this step, after its retries, does to the run. "fail"
+   * (default): the run ends as failed. "continue": the step is recorded as
+   * `error`, its `output` key holds `{ error: "<message>" }`, and the next
+   * step runs. A cancelled run is cancelled either way.
+   */
+  onError?: "fail" | "continue";
 }
 
 // ---- Field resolution modes -----------------------------------------------------
@@ -376,7 +391,7 @@ export const NODE_FIELD_MODES: Record<string, Record<string, FieldMode>> = {
 // Used by the validator to reject unknown fields. Own keys come straight from each
 // node's field-mode map, so the allow-list can never drift from the classification.
 
-const BASE_KEYS: readonly string[] = ["name", "do", "output", "retry", "timeout"];
+const BASE_KEYS: readonly string[] = ["name", "do", "output", "retry", "timeout", "onError"];
 
 export const NODE_KEYS: Record<string, ReadonlySet<string>> = Object.fromEntries(
   Object.entries(NODE_FIELD_MODES).map(([type, modes]) => [
@@ -436,7 +451,9 @@ export type FlowStatus =
   | "paused"
   | "waiting"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  // Never on a run record: the result of a start that `overlap: "skip"` refused.
+  | "skipped";
 
 export interface FlowResult {
   ok: boolean;
@@ -456,6 +473,8 @@ export interface FlowResult {
     timeout?: string;
   };
   error?: string;
+  /** Set when status = "skipped": the run of this flow that was still executing. */
+  runningInstanceId?: string;
 }
 
 // ---- Pending Approval -----------------------------------------------------------
