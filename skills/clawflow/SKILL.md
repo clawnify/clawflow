@@ -49,6 +49,12 @@ A flow is JSON with a `flow` name, an optional `env` block, and a `nodes` array.
 - **CRITICAL: `output` is required to store a node's result in state.** Without it, the result is discarded. This applies to ALL nodes including `loop`, `branch`, `parallel`, `condition`. If a downstream node references a result, the producing node MUST have `output`.
 - Always add `schema` to `ai` nodes when downstream nodes need typed fields
 - Use `retry` on `http` and `ai` nodes: `{ "limit": 3, "delay": "2s", "backoff": "exponential" }`
+- A step that fails after its retries ends the run. Put `"onError": "continue"` on a step whose failure the flow should handle itself: the step is recorded as failed, its `output` key holds `{ "error": "<message>" }`, and the next step runs. Test it with `"if": "work.error"`. On a step inside a loop, the loop goes on to the next item
+- An `http` step does not fail on a status code, it returns the body. Check the body, not for a failure
+- Flow memory has no atomic update: a read followed by a write can overwrite another run's write. Give each work item its own key (`order-{{ item.id }}`), never one shared list that several runs write
+- A flow that reads state, works, then writes it back must not run twice at once: put `"overlap": "skip"` at the top level of the flow (`flow_edit action: "set" fields: { "overlap": "skip" }`). A run of it is then refused while another is executing, whoever starts it
+- `timeout` is how long one attempt of a step may run (`"30s"`, `"5m"`, `"2h"`). A step without one gets 30 s, an `agent` step 120 s. Set it on every step that can take longer: an agent turn that may run 40 minutes needs `"timeout": "1h"`, and its turn in OpenClaw gets the same limit
+- Containers (`condition`, `branch`, `loop`, `parallel`), `sleep` and `wait` have no default limit: a loop runs as long as its iterations take, each step inside keeping its own `timeout`. A `timeout` set on a container caps everything inside it, all iterations of a loop together, so leave it off unless you want that cap
 - Use `do: exec` for deterministic operations (scripts, file processing, CLI tools) — never use `do: agent` for pure shell commands
 - Use `do: agent` for tasks that need tools (browser, exec, memory, MCP, CLI) — delegates to a real OpenClaw agent
 - Use `do: ai` for structured extraction and single-turn LLM calls
@@ -613,7 +619,11 @@ flow_trigger action: "create" flow: "digest" cron: "0 9 * * *" inputs: { "custom
   definition while the draft moves on.
 - **Missed runs are not replayed.** If the host was down at 09:00 the trigger
   does not fire at boot; it waits for the next occurrence.
-- Runs never overlap: if the previous run is still going, the tick is skipped.
+- A trigger never overlaps itself: while its previous run is still going, a
+  tick or a `run_now` is skipped, and the trigger shows `lastStatus: "skipped"`.
+  That covers this one trigger only. A run started with `flow_run`, by a
+  webhook, from the dashboard or by a second trigger can still run at the same
+  time, unless the flow says `"overlap": "skip"`.
 - Soft-deleting a flow (`flow_delete`) **pauses** its triggers rather than
   removing them, so a restore keeps them — restore then requires an explicit
   `resume`, so nothing silently re-arms.
@@ -623,6 +633,28 @@ flow_trigger action: "create" flow: "digest" cron: "0 9 * * *" inputs: { "custom
 - Arming, editing, pausing, resuming or deleting a schedule requires approval by default
   (same gate as flow authoring) — a schedule runs a flow unattended with tool
   access, so it is treated as a mutation.
+
+## Starting a run from a flow
+
+One flow can start another, one run per work item, and check on it later:
+
+```json
+{ "name": "start", "do": "http", "method": "POST", "url": "http://127.0.0.1:18793/flows/process-order/run", "body": { "order": "{{ item.id }}" }, "output": "started" },
+{ "name": "check", "do": "http", "url": "http://127.0.0.1:18793/flows/runs/{{ started.instanceId }}/status", "output": "run" }
+```
+
+- `/run` answers `{ "ok": true, "instanceId": "..." }` at once; the run goes on
+  by itself. Store the `instanceId` with the work item.
+- `/runs/<instanceId>/status` answers `status` (`running`, `paused`, `waiting`,
+  `completed`, `failed`, `cancelled`), `finished` (true for the last three) and,
+  for a failed run, `error`. On the next pass, free every item whose run is
+  `finished` instead of waiting out a time limit.
+- A run whose process was killed (a restart, a crash) ends as `failed` with an
+  `error` that starts with `Interrupted:`, within a couple of minutes. It is
+  not started again: start a new run for the item if the work still matters.
+- A flow that says `"overlap": "skip"` answers `/run` with
+  `{ "code": "flow_running", "runningInstanceId": "..." }` and no `instanceId`
+  while a run of it is going. Check `started.ok` before storing an id.
 
 ## Reading and discovering flows
 

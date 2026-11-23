@@ -222,7 +222,7 @@ Runs a task through a real OpenClaw agent with full tool access (browser, exec, 
 }
 ```
 
-On OpenClaw, this delegates to `openclaw agent --agent <id> --message "..."`. The agent gets full tool access — browser, shell, file system, memory, MCP. Falls back to a single AI call if the CLI is unavailable (standalone mode).
+On OpenClaw, this delegates to `openclaw agent --agent <id> --timeout <seconds> --message "..."`. The agent gets full tool access — browser, shell, file system, memory, MCP. Falls back to a single AI call if the CLI is unavailable (standalone mode).
 
 | Field | Description |
 |---|---|
@@ -230,6 +230,7 @@ On OpenClaw, this delegates to `openclaw agent --agent <id> --message "..."`. Th
 | `agent` | OpenClaw agent ID (e.g. `"main"`, `"ops"`). Uses config `defaultAgent` or `"main"` if omitted. |
 | `input` | Dotted path to context passed with the task |
 | `tools` | Hint for non-OpenClaw runtimes (OpenClaw agents have their own tool policy) |
+| `timeout` | How long the turn may run (default 120 s). The step's limit and the turn's limit in OpenClaw. See [Time Limits](#time-limits). |
 
 The distinction between `ai` and `agent` is intentional:
 - `do: ai` = deterministic, one-shot, structured output — use for classification, drafting, extraction
@@ -524,7 +525,7 @@ flow_trigger action: "create" flow: "digest" cron: "0 9 * * *" inputs: '{"custom
 | Timezone | IANA name (`Europe/Rome`); host local time when omitted |
 | Version | Latest published by default; pin with `version: 2` |
 | Missed runs | **Not replayed** — a host that was down at 09:00 waits for the next occurrence |
-| Overlap | A tick is skipped if the previous run is still going |
+| Overlap | A tick or a run-now is skipped while that trigger's previous run is still going, and the trigger records it (`lastStatus: "skipped"`) |
 | Flow deleted | Triggers are **paused**, not removed, so a restore keeps them |
 | Approval | Arming/pausing/deleting a schedule is gated like flow authoring |
 
@@ -533,6 +534,42 @@ Out-of-process callers — the Clawnify hook server and dashboard — read and w
 them by importing `TriggerStore` from `dist`, the same way they read published
 versions. The running scheduler re-reads the directory every 30s, so a schedule
 created or edited in the dashboard goes live without a restart.
+
+### One run at a time
+
+Two rules decide whether a run may start while another is going. "Going" means
+executing: a run paused at an approval holds nothing back, and it resumes when
+approved even if another run has started since.
+
+**A trigger never overlaps itself.** A tick, `flow_trigger action: "run_now"`
+and `POST /flows/triggers/:id/run` all refuse to start while that trigger's
+previous run is going. The trigger's record says so (`lastStatus: "skipped"`,
+and `lastError` names the run in flight), and the route answers 409
+`trigger_running` with `runningInstanceId`. Two triggers on one flow are
+independent, and so is a run started any other way.
+
+**A flow can allow one run at a time, whoever starts it.** Put `"overlap": "skip"`
+on the flow:
+
+```json
+{ "flow": "dispatch-orders", "overlap": "skip", "nodes": [ ... ] }
+```
+
+Then a run of it is not started while another run of it is executing, from any
+entry point. A trigger records the skip. `POST /flows/:name/run` answers 409:
+
+```json
+{ "error": "Flow \"dispatch-orders\" is already running (run 3f2a...)", "code": "flow_running", "flow": "dispatch-orders", "runningInstanceId": "3f2a..." }
+```
+
+`flow_run` returns `status: "skipped"` with the same `runningInstanceId`. A
+refused start writes no run record, and a webhook that asked for it is not
+queued. Use it for a flow that reads state, works, then writes it back. Leave
+it off (the default, `"allow"`) for a flow that is started once per work item
+and is meant to run many at once.
+
+The rule holds inside one engine process, which is where the scheduler, the
+flow server and `flow_run` all run.
 
 ---
 
@@ -560,6 +597,91 @@ Strongly recommended on `do: http` and `do: ai` nodes. Do not use on `do: wait` 
 
 ---
 
+## Errors
+
+A step that fails after its retries ends the run as `failed`, and nothing after
+it runs. `"onError": "continue"` on a step changes that for this step:
+
+```json
+{ "name": "work", "do": "agent", "task": "Process order {{ inputs.order }}", "timeout": "1h", "onError": "continue", "output": "work" },
+{ "name": "failed", "do": "condition", "if": "work.error", "then": [
+  { "name": "record", "do": "memory", "action": "write", "key": "order-{{ inputs.order }}", "value": "failed: {{ work.error }}" }
+] }
+```
+
+The step is recorded in the trace as `error`, its `output` key holds
+`{ "error": "<message>" }`, and the next step runs. A step that succeeded has
+no `error` there, so `"if": "work.error"` tells the two apart. It covers a step
+that runs out of time, and any step type, containers included: on a step
+inside a loop it lets the loop go on to the next item. A cancel still cancels
+the run, and `"onError": "fail"` is the default.
+
+An `http` step does not fail on a status code: it returns the body it got. Only
+a request that could not be made or answered counts as a failure.
+
+---
+
+## Starting a Run from a Flow
+
+A flow starts another flow with an `http` step on the flow server, and reads
+how that run is doing with a second one:
+
+```json
+{ "name": "start", "do": "http", "method": "POST", "url": "http://127.0.0.1:18793/flows/process-order/run", "body": { "order": "{{ item.id }}" }, "output": "started" },
+{ "name": "check", "do": "http", "url": "http://127.0.0.1:18793/flows/runs/{{ started.instanceId }}/status", "output": "run" }
+```
+
+`POST /flows/:name/run` answers 202 with `{ "ok": true, "instanceId": "..." }`
+and the run goes on by itself. `GET /flows/runs/:instanceId/status` answers:
+
+```json
+{ "ok": true, "instanceId": "3f2a...", "flow": "process-order", "status": "failed", "finished": true, "error": "Node \"work\": ...", "createdAt": "...", "updatedAt": "..." }
+```
+
+`status` is `running`, `paused`, `waiting`, `completed`, `failed` or
+`cancelled`. `finished` is true for the last three: the run will not change
+again. `error` is there for a failed or cancelled run, cut at 2000 characters.
+An unknown run answers 404 with `"code": "run_not_found"`.
+
+So a flow that hands work to other runs keeps each run's `instanceId` with the
+work item, and on its next pass frees the items whose run is `finished`,
+instead of waiting out that run's whole time limit.
+
+Like `/run` and `/cancel`, the status route needs only the run id, and it is
+read from the run's summary: no state, no outputs, no approval token. The
+routes that return those need the host's token (see "Reading and closing a
+configured store").
+
+A run whose process was killed before it could record its end does not stay
+`running`: it becomes `failed`, with an `error` that starts with `Interrupted:`
+(see "Interrupted runs" below). Nothing starts it again, so a flow that hands
+out work treats it like any other failed run.
+
+Flow memory has no atomic update. A `memory` read followed by a write can
+overwrite what another run wrote in between, so give each work item its own
+key (`order-{{ item.id }}`) and keep shared lists out of memory that several
+runs write.
+
+---
+
+## Time Limits
+
+`timeout` on a node is how long one attempt of it may run (`"30s"`, `"5m"`, `"2h"`). When it runs out, the attempt is stopped the way a cancel stops a step, and the next retry starts or the run fails with `Node "<name>" timed out after <ms>ms`.
+
+| Node | Limit when `timeout` is not set |
+|---|---|
+| `agent` | 120 s |
+| `condition`, `branch`, `loop`, `parallel` | None. Each step inside keeps its own limit. |
+| `sleep` | None. It lasts its `duration`. |
+| `wait` | None. An event wait expires after 24 h; an approval expires after 24 h. |
+| Any other step | 30 s |
+
+`maxNodeDurationMs` in the plugin config replaces the 30 s and 120 s defaults. A `timeout` set on a container caps everything inside it; on a loop, all its iterations together.
+
+An agent step's limit is also its turn's limit in OpenClaw: the runner passes it to `openclaw agent` as `--timeout`, in seconds rounded up. Without it, OpenClaw would end the turn after `agents.defaults.timeoutSeconds`, or 600 s when that is unset, however long the step allows. A turn that can take 40 minutes needs `"timeout": "1h"` on its step and nothing in `openclaw.json`.
+
+---
+
 ## Flow State and Durability
 
 Every flow run gets a unique `instanceId`. The runner persists state after every completed node. JSON files in `stateDir` remain the default; native SQLite and PostgreSQL are explicit alternatives. All three store checkpoints, memoized outputs, traces, the running step and pending approvals.
@@ -572,7 +694,22 @@ Every flow run gets a unique `instanceId`. The runner persists state after every
 
 **Retention.** Finished runs (completed, failed, cancelled) are deleted 30 days after their last update, together with their loop and branch instance files, by a daily sweep in the gateway process. Set `runRetentionDays` in the plugin config to change it; `0` keeps every run. Running, paused and waiting runs are never deleted.
 
-**Cancelling a run.** `flow_cancel { instanceId }`, or `POST /flows/runs/:instanceId/cancel` on the flow server (optional body `{ "reason": "..." }`), stops a run that has not finished. A run executing in the process stops on the step it is on: an agent step's `openclaw agent` process gets SIGTERM, on which the CLI aborts its turn in the gateway; an exec step's command is stopped with its whole process group; http and ai steps are aborted; a custom step gets `ctx.abortSignal` and is abandoned if it ignores it. The run ends with status `cancelled`, the interrupted step's trace entry too, and nothing after it runs. A run paused at an approval gate, or left `running` by a restart, is marked cancelled and its approval dropped; a runner in another process that still holds a run stops before its next step. The route answers 404 (`run_not_found`) for an unknown run and 409 (`run_finished`) for a finished one. Each attempt of a step is stopped the same way when it times out, before any retry starts; an agent step with no `timeout` gets 120 s per attempt.
+**Cancelling a run.** `flow_cancel { instanceId }`, or `POST /flows/runs/:instanceId/cancel` on the flow server (optional body `{ "reason": "..." }`), stops a run that has not finished. A run executing in the process stops on the step it is on: an agent step's `openclaw agent` process gets SIGTERM, on which the CLI aborts its turn in the gateway; an exec step's command is stopped with its whole process group; http and ai steps are aborted; a custom step gets `ctx.abortSignal` and is abandoned if it ignores it. The run ends with status `cancelled`, the interrupted step's trace entry too, and nothing after it runs. A run paused at an approval gate, or one whose process is gone and that has not been failed yet (see "Interrupted runs"), is marked cancelled and its approval dropped; a runner in another process that still holds a run stops before its next step. The route answers 404 (`run_not_found`) for an unknown run and 409 (`run_finished`) for a finished one. Each attempt of a step is stopped the same way when it times out, before any retry starts; an agent step with no `timeout` gets 120 s per attempt.
+
+**Interrupted runs.** A run is executed by one process, and only that process can record how it ended. If it is killed, crashes or loses power first, the run would say `running` for good. So every run names the process executing it, a process tells the store it is alive every 20 seconds for as long as it has runs there, and every 30 seconds the gateway process looks for runs whose process is gone. Such a run ends as `failed`, with the error `Interrupted: the process running this flow stopped during step "<name>", before the run could finish.` The step it was on is marked `error` in the trace, the loop iteration or branch it was inside ends the same way, and nothing after it runs. The run is not started again: `http`, `exec` and `agent` steps have effects outside the flow, and repeating them is the caller's decision.
+
+A process counts as gone when:
+
+- **The store has not heard from it for two minutes.** This holds for every store, and it is the only test that survives a reboot (the old pid may by then belong to another process), a state directory restored onto another machine, and a PostgreSQL namespace shared by engines on several hosts. SQLite and PostgreSQL measure the two minutes on the database's clock, so hosts need not agree on the time.
+- **Its pid no longer exists**, with JSON or SQLite storage, which only processes on the same machine can write. This only ever finds a dead process sooner: an engine that is restarted settles the runs its predecessor left within seconds, not minutes.
+
+How long a run has been quiet is never the test. A `sleep` or an event wait writes nothing for days and is still alive.
+
+A process that was stalled for more than two minutes, not dead, can find its run failed when it comes back. The run stays failed: the process stops before its next step, also in the middle of a loop, and writes nothing to the run's record. A finished run does not change again. A run cancelled from another process now stops the same way, at the next step of the loop it is in.
+
+A run that pauses at an approval has no process until someone resumes it, so it is never failed for this reason, and whichever process resumes it becomes the one it names.
+
+A run started by ClawFlow before 1.11.0 names no process. Nothing proves it dead, so it is left as it is. Cancel it, or call `POST /flows/runs/reconcile` with `{ "unowned": true }` once after upgrading, when no older engine is still running flows on that store. Other hosts call `runner.reconcile()`, which is the same pass. With JSON storage the processes are listed in `flow-state/_owners/`, one small file each, removed when the process has no runs left.
 
 **Reading runs.** `flow_status` lists runs newest first, 20 per page (`limit`, then `cursor` from the previous page). One run comes back whole when it is small, and otherwise as a summary: status, error, each state key with its size, and the trace without outputs. Read any single value with `path`, e.g. `state.leads` or `trace.3.output`; arrays and long strings come back a page at a time (`offset`, `limit`). `flow_run` and `flow_resume` return the same summary when a run is too large to read in one tool result. The same functions (`listRuns`, `summarizeRun`, `readRunValue`, `sweepRuns`) are exported for other hosts. With JSON storage, a small summary of each run is kept in `flow-state/_index/`, so a list reads a few hundred bytes per run instead of parsing every record; an entry older than its record is ignored, and the daily sweep fills in missing ones.
 
@@ -683,6 +820,12 @@ same configured runner:
   Approval resolves the definition through `resolveRunnableFlow` (published
   version preferred); decline atomically cancels and consumes its approval.
   A 202 is sent only after the durable resume claim, before later steps finish.
+- `POST /flows/runs/reconcile`, optionally with `{ "unowned": true }`, fails the
+  runs whose process is gone now, without waiting for the gateway's next pass,
+  and answers `{ "failed": [{ "instanceId", "flowName", "error" }], "unowned": <count>, "errors": [...] }`.
+  `unowned` counts the running runs that name no process and were left alone;
+  with `"unowned": true` they are failed too. `errors` lists runs it could not
+  end, each with the reason. See "Interrupted runs".
 
 The configured listener prefix replaces `/flows`. These new routes require
 `Authorization: Bearer <OPENCLAW_GATEWAY_TOKEN>` (or the host gateway's configured
@@ -718,7 +861,10 @@ There is no automatic conversion on startup. Before switching storage:
    reader as well as the runner to use the same storage configuration, then restart.
 
 The importer copies all run records, including child runs, and pending approvals;
-it ignores the derived `_index` directory. It never modifies or removes the JSON
+it ignores the derived `_index` directory and the `_owners` directory. A run
+that was still `running` in the source and names a process is failed by the
+gateway's first pass after the switch: every writer was stopped, so that
+process is gone. It never modifies or removes the JSON
 source. Each run and its approvals commit atomically, bounded by one record at a
 time. Identical records are accepted on retry; different destination records,
 malformed JSON and orphaned approvals stop the import. Earlier committed runs

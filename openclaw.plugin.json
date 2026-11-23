@@ -2,7 +2,7 @@
   "id": "clawflow",
   "name": "ClawFlow",
   "description": "The n8n for agents. Declarative, AI-native workflow engine \u2014 LLM-writable, Cloudflare-portable.",
-  "version": "1.9.1",
+  "version": "1.11.0",
   "skills": [
     "./skills/clawflow"
   ],
@@ -222,7 +222,8 @@
     },
     "maxNodeDurationMs": {
       "label": "Node Timeout (ms)",
-      "placeholder": "30000"
+      "placeholder": "30000",
+      "help": "Default limit for one step without its own timeout, for every step type. Unset: 30000, or 120000 for agent steps. Containers (condition, branch, loop, parallel), sleep and wait never get a default."
     },
     "serve": {
       "label": "Flow HTTP Server",

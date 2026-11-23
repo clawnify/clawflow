@@ -8,6 +8,8 @@ type Row = Record<string, unknown>;
 export type Query = (sql: string, params?: unknown[]) => Promise<Row[]>;
 export interface SqlDriver {
   readonly lock: string;
+  /** SQL for the database's clock, in milliseconds since the epoch. */
+  readonly nowMs: string;
   transaction<T>(fn: (query: Query) => Promise<T>, write?: boolean): Promise<T>;
   close(): Promise<void>;
 }
@@ -40,6 +42,12 @@ const schema = [
     PRIMARY KEY (namespace, token),
     FOREIGN KEY (namespace, instance_id) REFERENCES clawflow_runs (namespace, id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS clawflow_approvals_run ON clawflow_approvals (namespace, instance_id)`,
+  // Engine processes with runs here and when each last said it was alive
+  // (ownership.ts). Added after version 1 without a new version: an engine
+  // that predates it never reads the table, and this one creates it on open.
+  `CREATE TABLE IF NOT EXISTS clawflow_owners (
+    namespace TEXT NOT NULL, id TEXT NOT NULL, record TEXT NOT NULL, heartbeat_ms BIGINT NOT NULL,
+    PRIMARY KEY (namespace, id))`,
 ];
 
 async function initialize(query: Query): Promise<void> {
@@ -63,6 +71,7 @@ const queues = globalQueues[queueKey] ??= new Map();
 
 export class SqliteDriver implements SqlDriver {
   readonly lock = "";
+  readonly nowMs = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
   private db?: DatabaseSync;
   private initialized = false;
   private closed = false;
@@ -127,6 +136,7 @@ export class SqliteDriver implements SqlDriver {
 
 export class PostgresDriver implements SqlDriver {
   readonly lock = " FOR UPDATE";
+  readonly nowMs = "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)";
   private pool?: Pool;
   private ready?: Promise<void>;
   private closed = false;
