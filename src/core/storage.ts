@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { StateStore, type InstanceRecord } from "./store.js";
+import { StateStore, type InstanceRecord, type RunIndexEntry } from "./store.js";
 import { SqlStateStore } from "./sql-store.js";
 import type { FlowState, PendingApproval } from "./types.js";
 import type { ListRunsOptions, ListSubRunsOptions, RunPage, SweepResult } from "./runs.js";
@@ -19,6 +19,9 @@ export interface ExecutionStore {
   readonly identity: string;
   create(id: string, flow: string, state: FlowState): Awaitable<InstanceRecord>;
   get(id: string): Awaitable<InstanceRecord | null>;
+  /** A top-level run's list row (what listRuns returns for it), read without
+   *  parsing its record where the store can. Null for an unknown run. */
+  summary(id: string): Awaitable<RunIndexEntry | null>;
   update(id: string, patch: Partial<InstanceRecord>): Awaitable<InstanceRecord>;
   checkpoint(id: string, patch: Partial<InstanceRecord>, memo?: { node: string; output: unknown }, approval?: PendingApproval): Awaitable<InstanceRecord>;
   memoize(id: string, node: string, output: unknown): Awaitable<void>;

@@ -19,8 +19,9 @@ export async function controlRequest(
   const pathname = url.pathname.replace(/\/+$/, "");
   if (pathname !== base && !pathname.startsWith(`${base}/`)) return false;
   const parts = pathname.slice(base.length).split("/").filter(Boolean);
-  // Preserve the older cancellation endpoint's contract in serve.ts.
-  if (parts.length === 2 && parts[1] === "cancel") return false;
+  // Served by serve.ts to whoever holds the run id: cancelling a run (the
+  // older endpoint's contract) and reading whether it is over.
+  if (parts.length === 2 && (parts[1] === "cancel" || parts[1] === "status")) return false;
   const supplied = req.headers.authorization;
   const expected = typeof token === "string" && token ? `Bearer ${token}` : "";
   if (!expected || typeof supplied !== "string" || Buffer.byteLength(supplied) !== Buffer.byteLength(expected)

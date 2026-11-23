@@ -293,4 +293,36 @@ describe("TriggerScheduler", () => {
     assert.ok(stored?.nextRunAt, "next occurrence recorded after firing");
   });
 
+  it("does not start a run while the previous one is still going", async () => {
+    // A run can last hours (a loop of long agent steps), longer than its
+    // schedule's interval. A second run would pick up the same work.
+    cleanup();
+    const store = new TriggerStore(workspace);
+    writeDraft("slow-ticker", "'tick'");
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let fires = 0;
+    const slowRunner = {
+      run: async (def: FlowDefinition, inputs: unknown, instanceId: string) => {
+        fires++;
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 2_500));
+        inFlight--;
+        return new FlowRunner(baseCfg).run(def, inputs, instanceId);
+      },
+    };
+    const scheduler = new TriggerScheduler({ runner: slowRunner, store, workspace, flowsDir, logger: silent });
+    store.create({ flowName: "slow-ticker", cron: "* * * * * *" });
+
+    scheduler.start();
+    await new Promise((r) => setTimeout(r, 4_200));
+    scheduler.stop();
+    while (inFlight > 0) await new Promise((r) => setTimeout(r, 50));
+
+    assert.ok(fires >= 1, "the trigger fired");
+    assert.equal(maxInFlight, 1, `runs overlapped: ${maxInFlight} at once`);
+  });
+
 });

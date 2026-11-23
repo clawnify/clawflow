@@ -123,6 +123,13 @@ function applyFilter(val: unknown, filter: string): unknown {
 
 // ---- Runner ---------------------------------------------------------------------
 
+/** Steps with no default time limit, only the `timeout` set on them. A
+ *  container (condition, branch, loop, parallel) runs steps that each have
+ *  their own limit, and a default around all of them stopped a loop of long
+ *  agent steps at 30 s. A sleep lasts its `duration`, and a wait for an event
+ *  has its own 24 h default. */
+const NO_DEFAULT_TIMEOUT: ReadonlySet<string> = new Set(["condition", "branch", "loop", "parallel", "sleep", "wait"]);
+
 export class FlowRunner {
   private cfg: PluginConfig;
   private store: ExecutionStore;
@@ -202,6 +209,39 @@ export class FlowRunner {
     const id = instanceId ?? crypto.randomUUID();
     const state: FlowState = { inputs: input };
 
+    // `overlap: "skip"`: refuse the start while another run of this flow is
+    // executing. The check and the registration below happen before the first
+    // await, so two starts in the same instant cannot both pass.
+    const running = this.overlapping(flow);
+    if (running) {
+      return {
+        ok: false,
+        status: "skipped",
+        flowName: flow.flow,
+        instanceId: id,
+        state,
+        trace: [],
+        error: `Flow "${flow.flow}" is already running (run ${running}); it allows one run at a time ("overlap": "skip")`,
+        runningInstanceId: running,
+      };
+    }
+    const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
+    liveRuns.set(this.runKey(id), live);
+    try {
+      return await this.startRun(flow, input, id, state, live);
+    } finally {
+      if (liveRuns.get(this.runKey(id)) === live) liveRuns.delete(this.runKey(id));
+    }
+  }
+
+  /** Check inputs, resolve env and execute a run whose live entry is held. */
+  private async startRun(
+    flow: FlowDefinition,
+    input: unknown,
+    id: string,
+    state: FlowState,
+    live: LiveRun,
+  ): Promise<FlowResult> {
     // Validate declared inputs against the actual payload before any node runs.
     if (flow.inputs && typeof flow.inputs === "object") {
       const payload = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
@@ -281,7 +321,22 @@ export class FlowRunner {
       if (Object.keys(env).length > 0) state.env = env;
     }
 
-    return this.executeRun(flow, state, id, 0, []);
+    return this.executeRun(flow, state, id, 0, [], live);
+  }
+
+  /**
+   * The run that holds back a new run of `flow`: set only when the flow says
+   * `overlap: "skip"` and a run of it is executing in this process against the
+   * same store. Returns that run's instanceId.
+   */
+  overlapping(flow: FlowDefinition): string | undefined {
+    if (flow.overlap !== "skip") return undefined;
+    const prefix = `${this.store.identity}\0`;
+    for (const [key, run] of liveRuns) {
+      // Sub-flows are never registered, so every entry is a top-level run.
+      if (run.flowName === flow.flow && key.startsWith(prefix)) return key.slice(prefix.length);
+    }
+    return undefined;
   }
 
   // ---- Resume after approval ----------------------------------------------------
@@ -387,8 +442,11 @@ export class FlowRunner {
     instanceId: string,
     startIndex: number,
     priorTrace: TraceEntry[],
+    held?: LiveRun,
   ): Promise<FlowResult> {
-    const live: LiveRun = { controller: new AbortController(), flowName: flow.flow };
+    // A new run registered itself before its first await (runFlow); a resumed
+    // run registers here.
+    const live: LiveRun = held ?? { controller: new AbortController(), flowName: flow.flow };
     liveRuns.set(this.runKey(instanceId), live);
     try {
       const done = this.execute(flow, state, instanceId, startIndex, priorTrace, live.controller.signal);
@@ -543,6 +601,14 @@ export class FlowRunner {
         trace.push(entry);
         const cancelled = await this.cancelledOnRecord(instanceId);
         if (cancelled) return this.endCancelled(flow, state, instanceId, trace, cancelled);
+        if (node.onError === "continue") {
+          // The failure becomes the step's result and the run goes on. It is
+          // not memoized: a retry of the container around it runs it again.
+          if (node.output) state[node.output] = { error: message };
+          await this.store.update(instanceId, { state, trace, running: undefined });
+          i++;
+          continue;
+        }
         const error = `Node "${node.name}": ${message}`;
         await this.store.update(instanceId, { status: "failed", state, trace, error, running: undefined });
         return {
@@ -597,7 +663,7 @@ export class FlowRunner {
     for (let attempt = 1; attempt <= policy.limit; attempt++) {
       if (signal.aborted) throw abortReason(signal);
       const { controller, dispose } = childController(signal);
-      const timer = setTimeout(
+      const timer = nodeTimeoutMs === undefined ? undefined : setTimeout(
         () => controller.abort(new Error(`Node "${node.name}" timed out after ${nodeTimeoutMs}ms`)),
         nodeTimeoutMs,
       );
@@ -623,11 +689,13 @@ export class FlowRunner {
     throw lastError;
   }
 
-  /** How long one attempt of a step may run before it fails and is stopped.
+  /** How long one attempt of a step may run before it fails and is stopped, or
+   *  undefined when it has no limit of its own (see NO_DEFAULT_TIMEOUT).
    *  An agent step defaults to the 120 s its `openclaw agent` process always
    *  had: with 30 s here the step failed while its turn ran on in the gateway. */
-  private nodeTimeoutMs(node: FlowNode): number {
+  private nodeTimeoutMs(node: FlowNode): number | undefined {
     if (node.timeout) return parseDuration(node.timeout);
+    if (NO_DEFAULT_TIMEOUT.has(node.do)) return undefined;
     return this.cfg.maxNodeDurationMs ?? (node.do === "agent" ? 120_000 : 30_000);
   }
 
@@ -1160,9 +1228,8 @@ export class FlowRunner {
         ? `${task}\n\nContext:\n${typeof input === "object" ? JSON.stringify(input, null, 2) : String(input)}`
         : task;
 
-    const timeoutMs = node.timeout
-      ? parseDuration(node.timeout)
-      : undefined;
+    // The limit runWithRetry puts on this step. An agent step always has one.
+    const timeoutMs = this.nodeTimeoutMs(node)!;
 
     const target = {
       // new names win; agentId/session are accepted as deprecated aliases
@@ -1217,7 +1284,7 @@ export class FlowRunner {
     message: string,
     target: { agent?: string; sessionKey?: string; sessionId?: string; channel?: string },
     state: FlowState,
-    nodeTimeoutMs?: number,
+    timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<string> {
     const { execFile } = await import("child_process");
@@ -1232,7 +1299,12 @@ export class FlowRunner {
     }
 
     if (signal?.aborted) throw abortReason(signal);
-    const args = ["agent", ...this.buildAgentArgs(target), "--message", message];
+    // Without --timeout, OpenClaw stops the turn after agents.defaults.timeoutSeconds,
+    // or 600 s when that is unset, however long the step may run. Pass the
+    // step's own limit, rounded up so the runner's timer still fires first and
+    // fails the step with its own message. Never 0, which means no limit.
+    const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+    const args = ["agent", ...this.buildAgentArgs(target), "--timeout", String(timeoutSeconds), "--message", message];
 
     // Merge flow-level env vars (state.env) into the child process environment.
     // Set CLAWFLOW_NO_SERVE to prevent the child from binding the webhook port.
@@ -1248,7 +1320,7 @@ export class FlowRunner {
       // sending chat.abort for the turn it started, so the turn stops in the
       // gateway too instead of running on (or staying queued) without the flow.
       const { stdout } = await execFileAsync("openclaw", args, {
-        timeout: nodeTimeoutMs ?? this.cfg.maxNodeDurationMs ?? 120_000,
+        timeout: timeoutMs,
         maxBuffer: 10 * 1024 * 1024, // 10MB
         env,
         signal,
@@ -2247,6 +2319,26 @@ export class FlowRunner {
     return this.store;
   }
 
+  /**
+   * Whether a top-level run is over, and how it ended. Read from the run's
+   * summary, never its record, so polling it costs the same however much the
+   * run has produced. Carries nothing a holder of the run id could not already
+   * act on: no state, no outputs, no approval token.
+   */
+  async runStatus(instanceId: string): Promise<RunStatus | null> {
+    const run = await this.store.summary(instanceId);
+    if (!run) return null;
+    return {
+      instanceId: run.instanceId,
+      flow: run.flowName,
+      status: run.status,
+      finished: FINISHED_STATUSES.has(run.status),
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+      ...(run.error ? { error: run.error.slice(0, RUN_STATUS_ERROR_CHARS) } : {}),
+    };
+  }
+
   /** List all pending approvals across all flow instances */
   listApprovals() {
     return this.store.listApprovals();
@@ -2301,3 +2393,18 @@ export type CancelResult =
   | { ok: false; instanceId: string; error: "finished"; status: FlowStatus };
 
 const FINISHED_STATUSES = new Set<string>(["completed", "failed", "cancelled"]);
+
+/** What runStatus() answers. `finished` is true once the run can no longer
+ *  change: completed, failed or cancelled. */
+export interface RunStatus {
+  instanceId: string;
+  flow: string;
+  status: Exclude<FlowStatus, "skipped">;
+  finished: boolean;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
+/** An error can quote a whole response body; a status read stays small. */
+const RUN_STATUS_ERROR_CHARS = 2_000;
